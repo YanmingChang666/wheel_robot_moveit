@@ -92,12 +92,36 @@ STEP = (
 )
 
 
+def _publish_holding():
+    # outputs:Closed is true only while the cup is actually holding a body.
+    # The command topic stays true even when the seal missed, which is what
+    # let the arm place an empty cup and stack the next box on air.
+    pairs = (
+        ("/ActionGraph/suction_left", "/ActionGraph/suction_holding_pub"),
+        ("/ActionGraph/suction_right", "/ActionGraph/suction_holding_pub_right"),
+    )
+    for grip_path, pub_path in pairs:
+        grip = og.Controller.node(grip_path)
+        pub = og.Controller.node(pub_path)
+        if not grip.is_valid() or not pub.is_valid():
+            continue
+        closed = grip.get_attribute("outputs:Closed")
+        data = pub.get_attribute("inputs:data")
+        if not closed.is_valid() or not data.is_valid():
+            continue
+        try:
+            data.set(bool(closed.get()))
+        except Exception:
+            continue
+
+
 def compute(db):
     for path in STEP:
         _pulse(path)
     for key, subscriber, prim_path, close_path, open_path in ARMS:
         _on_change(key + "_ros", _ros_closed(subscriber), close_path, open_path)
         _on_change(key + "_prim", _prim_closed(prim_path), close_path, open_path)
+    _publish_holding()
     return True
 '''
 
@@ -266,6 +290,8 @@ def _graph(stage):
         "suction_right_open",
         "suction_left_sub",
         "suction_right_sub",
+        "suction_holding_pub",
+        "suction_holding_pub_right",
         "suction_command",
     ]
     for name in stale:
@@ -288,6 +314,8 @@ def _graph(stage):
                 ("suction_right_step", "omni.graph.action.OnImpulseEvent"),
                 ("suction_left_sub", "isaacsim.ros2.bridge.ROS2Subscriber"),
                 ("suction_right_sub", "isaacsim.ros2.bridge.ROS2Subscriber"),
+                ("suction_holding_pub", "isaacsim.ros2.bridge.ROS2Publisher"),
+                ("suction_holding_pub_right", "isaacsim.ros2.bridge.ROS2Publisher"),
                 ("suction_command", "omni.graph.scriptnode.ScriptNode"),
             ],
             keys.SET_VALUES: [
@@ -315,6 +343,14 @@ def _graph(stage):
                 ("suction_right_sub.inputs:messageSubfolder", "msg"),
                 ("suction_right_sub.inputs:messageName", "Bool"),
                 ("suction_right_sub.inputs:topicName", "right_suction_cmd"),
+                ("suction_holding_pub.inputs:messagePackage", "std_msgs"),
+                ("suction_holding_pub.inputs:messageSubfolder", "msg"),
+                ("suction_holding_pub.inputs:messageName", "Bool"),
+                ("suction_holding_pub.inputs:topicName", "left_suction_holding"),
+                ("suction_holding_pub_right.inputs:messagePackage", "std_msgs"),
+                ("suction_holding_pub_right.inputs:messageSubfolder", "msg"),
+                ("suction_holding_pub_right.inputs:messageName", "Bool"),
+                ("suction_holding_pub_right.inputs:topicName", "right_suction_holding"),
                 ("suction_command.inputs:usePath", False),
                 ("suction_command.inputs:script", SUCTION_SCRIPT),
             ],
@@ -328,8 +364,12 @@ def _graph(stage):
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_left_sub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_right_sub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_command.inputs:execIn"),
+        ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_holding_pub.inputs:execIn"),
+        ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_holding_pub_right.inputs:execIn"),
         ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/suction_left_sub.inputs:context"),
         ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/suction_right_sub.inputs:context"),
+        ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/suction_holding_pub.inputs:context"),
+        ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/suction_holding_pub_right.inputs:context"),
         ("/ActionGraph/suction_left_close.outputs:execOut", "/ActionGraph/suction_left.inputs:Close"),
         ("/ActionGraph/suction_left_open.outputs:execOut", "/ActionGraph/suction_left.inputs:Open"),
         ("/ActionGraph/suction_right_close.outputs:execOut", "/ActionGraph/suction_right.inputs:Close"),

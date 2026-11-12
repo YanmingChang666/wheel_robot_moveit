@@ -8,7 +8,7 @@ http://pds25.egloos.com/pds/201504/21/98/RectangleBinPack.pdf
 The same heuristic is what the MIT-licensed rectpack library implements. This
 module is a small reimplementation so the stack node has no extra dependency.
 Identical 351 x 287 mm faces on a 1200 x 1000 mm pallet produce a 3 x 3 grid.
-Layers repeat until the pile would pass 1080 mm (10 layers, 1050 mm).
+Layers repeat until the pile would pass 1160 mm (11 layers).
 
 Changes from the previous revision
 ----------------------------------
@@ -35,7 +35,7 @@ BOX = (0.351, 0.287, 0.105)
 # last centimetres of the lift drop and fold the arm, so the cup stops high.
 PACK_GAP = 0.015
 PALLET_FOOTPRINT = (1.200, 1.000)
-PALLET_MAX_HEIGHT = 1.080
+PALLET_MAX_HEIGHT = 1.160
 PALLET_THICKNESS = 0.125
 # Min corner of the wooden pallet measured from wheel_robot_suction_stack.usd.
 # The prim order is scale then translate, and the translate is scaled, so the
@@ -54,10 +54,23 @@ PALLET_TOP_Z = PALLET_THICKNESS + RISER_HEIGHT
 STAND_TOP_Z = 0.35
 PICKUP_XY = (0.55, 0.18)
 STAND_SIZE = (0.50, 0.36, 0.30)
-# Left-arm shoulder at lift 0, from the wheel-robot URDF.
+# Left-arm shoulder at lift 0 and waist yaw 0, from the wheel-robot URDF.
 SHOULDER_XY = (0.13755, 0.1212)
-# Horizontal distance the downward wrist can be expected to reach.
-REACH_M = 0.85
+# Waist yaw axis in the base frame (lift 0, pitch 0), and each shoulder's
+# offset from that axis. Positive yaw swings the left shoulder toward +X.
+WAIST_AXIS_XY = (0.14355, 0.0)
+ARM_SHOULDER = {
+    "left": (-0.006, 0.1212),
+    "right": (-0.006, -0.1212),
+}
+# Shoulder-to-cup distance with the seal pointing down. The link chain is
+# 0.79 m, and the last link has to stay vertical, so the cup reaches about
+# 0.50 m horizontally. 0.40 m is the distance that actually set a box down:
+# 0.44 m reached the middle-right cell in XY and then stuck 7 cm high with
+# the lift already at 0. 0.85 m counted a straight arm and sent the chassis
+# to the pallet center, where every inverse solution fails.
+REACH_M = 0.40
+PLACE_REACH = 0.40
 # Cup geometry from create_suction_robot_usd._add_cup. The gold lip is a
 # cylinder of height 0.008 centered at 0.044, so the sealing face is 0.048
 # along tool +Z. The surface-gripper sample point is 0.051 and closes
@@ -93,8 +106,8 @@ BASE_MARGIN = 0.05
 # Slot position in the base frame that the downward tool was checked against
 # at deck height. These are the verified offsets from the old base_for_slot.
 # Widen them only after checking the arm really reaches there.
-LOCAL_X_OPTIONS = (0.05, 0.12, 0.20, 0.30, 0.38)
-LOCAL_Y_OPTIONS = (0.32, 0.36, 0.40, 0.45)
+LOCAL_X_OPTIONS = (0.05, 0.12, 0.16, 0.24, 0.32, 0.40, 0.52)
+LOCAL_Y_OPTIONS = (0.36, 0.42, 0.48, 0.52, 0.56, 0.64, 0.72, 0.80)
 LOCAL_X_PREFERRED = 0.15
 LOCAL_Y_PREFERRED = 0.42
 # Headings tried for the chassis. Only heading 0 has been verified, so it is the
@@ -108,6 +121,16 @@ YAW_PENALTY = 0.2
 
 class NoBasePose(RuntimeError):
     """No chassis pose reaches the slot without touching the pallet or stand."""
+
+
+@dataclass(frozen=True)
+class ArmPlan:
+    """Chassis pose and waist yaw that put one cup over a slot or the stand."""
+
+    arm: str
+    base: tuple
+    waist: float
+    distance: float
 
 
 @dataclass(frozen=True)
@@ -203,23 +226,32 @@ def layer_count(box_z=BOX[2], max_height=PALLET_MAX_HEIGHT):
 
 
 def all_slots():
-    """Every slot of the pattern, ignoring whether the robot can reach it."""
-    layer = pack_layer(
-        PALLET_FOOTPRINT[0], PALLET_FOOTPRINT[1], BOX[0] + PACK_GAP, BOX[1] + PACK_GAP
-    )
+    """Nine boxes per layer, centered on the pallet, layers from the bottom.
+
+    The long side of the box runs along the pallet's 1.2 m side, so a 3 by 3
+    grid fits with an equal margin on every edge. A layer is finished before
+    the next one starts.
+    """
+    columns = 3
+    rows = 3
+    cell_x = BOX[0] + PACK_GAP
+    cell_y = BOX[1] + PACK_GAP
+    margin_x = (PALLET_FOOTPRINT[0] - columns * cell_x) / 2.0
+    margin_y = (PALLET_FOOTPRINT[1] - rows * cell_y) / 2.0
     slots = []
     for level in range(layer_count()):
-        for x, y, width, height, rotated in layer:
-            slots.append(
-                Slot(
-                    index=len(slots),
-                    layer=level,
-                    x=PALLET_ORIGIN[0] + x + width / 2.0,
-                    y=PALLET_ORIGIN[1] + y + height / 2.0,
-                    z=PALLET_TOP_Z + (level + 0.5) * BOX[2],
-                    rotated=rotated,
+        for row in range(rows):
+            for col in range(columns):
+                slots.append(
+                    Slot(
+                        index=len(slots),
+                        layer=level,
+                        x=PALLET_ORIGIN[0] + margin_x + (col + 0.5) * cell_x,
+                        y=PALLET_ORIGIN[1] + margin_y + (row + 0.5) * cell_y,
+                        z=PALLET_TOP_Z + (level + 0.5) * BOX[2],
+                        rotated=False,
+                    )
                 )
-            )
     return slots
 
 
@@ -248,10 +280,13 @@ def _keep_out_rects():
     return pallet, stand
 
 
-def shoulder_world(base):
-    """World xy of the left-arm shoulder for a base pose (x, y, yaw)."""
-    ox, oy = _rotate(SHOULDER_XY[0], SHOULDER_XY[1], base[2])
-    return (base[0] + ox, base[1] + oy)
+def shoulder_world(base, arm="left", waist=0.0):
+    """World xy of one shoulder for a base pose (x, y, yaw) and waist yaw."""
+    off = ARM_SHOULDER[arm]
+    ox, oy = _rotate(off[0], off[1], waist)
+    lx, ly = WAIST_AXIS_XY[0] + ox, WAIST_AXIS_XY[1] + oy
+    rx, ry = _rotate(lx, ly, base[2])
+    return (base[0] + rx, base[1] + ry)
 
 
 def reach_distance(base, slot):
@@ -260,14 +295,22 @@ def reach_distance(base, slot):
     return math.hypot(slot.x - sx, slot.y - sy)
 
 
+def _footprint_hits(base, rects):
+    c, s = abs(math.cos(base[2])), abs(math.sin(base[2]))
+    half_x = c * BASE_HALF[0] + s * BASE_HALF[1] + BASE_MARGIN
+    half_y = s * BASE_HALF[0] + c * BASE_HALF[1] + BASE_MARGIN
+    return any(_rect_overlap(base[0], base[1], half_x, half_y, rect) for rect in rects)
+
+
 def base_is_clear(base):
     """True when the chassis footprint touches neither the pallet nor the stand."""
-    c, s = abs(math.cos(base[2])), abs(math.sin(base[2]))
-    half_x = c * BASE_HALF[0] + s * BASE_HALF[1]
-    half_y = s * BASE_HALF[0] + c * BASE_HALF[1]
-    half_x += BASE_MARGIN
-    half_y += BASE_MARGIN
-    return not any(_rect_overlap(base[0], base[1], half_x, half_y, rect) for rect in _keep_out_rects())
+    return not _footprint_hits(base, _keep_out_rects())
+
+
+def _clear_of_pallet(base):
+    """The pickup stand may be grazed. The pallet may not."""
+    pallet, _stand = _keep_out_rects()
+    return not _footprint_hits(base, (pallet,))
 
 
 @lru_cache(maxsize=None)
@@ -316,21 +359,287 @@ def slot_is_reachable(slot, reach=REACH_M, **kwargs):
     return True
 
 
-def pallet_slots(reach=REACH_M, **kwargs):
-    """Slots the left arm can fill, in fill order.
+# Slot position in the base frame. The shoulder sits ahead of the chassis
+# center, so a cup 0.36 m from the shoulder can be 0.6 m from that center.
+# The clear band beside the pallet is only a few centimetres wide, so the
+# step has to be finer than the gap between a pose on the pallet and a pose
+# past the arm's reach.
+_PLAN_X = (0.08, 0.16, 0.24, 0.32, 0.40, 0.52)
+_PLAN_Y = (0.00, 0.16, 0.28, 0.36, 0.42, 0.48, 0.52, 0.56, 0.64, 0.72)
+_PLAN_WAIST = (-1.0, -0.5, 0.0, 0.5, 1.0)
 
-    A slot is kept only when ``base_for_slot`` finds a chassis pose for it.
-    Within a layer the far row (largest y) is filled first, so the arm never
-    reaches over boxes it has just placed. Use ``unreachable_slots`` to see
-    what was left out.
+
+def _clear_with_margin(base, extra):
+    """``base_is_clear``, with ``extra`` metres added to the chassis keep-out."""
+    if extra <= 0.0:
+        return base_is_clear(base)
+    cosine, sine = abs(math.cos(base[2])), abs(math.sin(base[2]))
+    half_x = cosine * BASE_HALF[0] + sine * BASE_HALF[1] + BASE_MARGIN + extra
+    half_y = sine * BASE_HALF[0] + cosine * BASE_HALF[1] + BASE_MARGIN + extra
+    return not any(
+        _rect_overlap(base[0], base[1], half_x, half_y, rect) for rect in _keep_out_rects()
+    )
+
+
+def _nearest_plans(x, y, reach, allow_stand, home_weight=0.0, extra_margin=0.0):
+    """Best clear chassis pose for each arm, cup about 0.36 m from the shoulder.
+
+    Farther than ``reach`` the wrist cannot stay pointed down. That is what
+    left the middle-right box 7 cm in the air. The pallet-center cell stays
+    about 0.64 m from either shoulder, so it never appears here.
     """
-    slots = [slot for slot in all_slots() if slot_is_reachable(slot, reach=reach, **kwargs)]
+    found = {}
+    for arm in ("left", "right"):
+        best = None
+        for yaw in SIDE_YAWS:
+            for waist in _PLAN_WAIST:
+                for ix in range(-16, 17):
+                    for iy in range(-16, 17):
+                        base = (x + ix * 0.08, y + iy * 0.08, yaw)
+                        if allow_stand:
+                            if not _clear_of_pallet(base):
+                                continue
+                        elif not _clear_with_margin(base, extra_margin):
+                            continue
+                        sx, sy = shoulder_world(base, arm, waist)
+                        distance = math.hypot(x - sx, y - sy)
+                        if distance < 0.28 or distance > reach:
+                            continue
+                        # Waist zero inside the reach beats a closer pose that
+                        # is twisted out to the joint limit.
+                        cost = (
+                            abs(distance - 0.36)
+                            + 0.35 * abs(waist)
+                            + home_weight * math.hypot(base[0], base[1])
+                        )
+                        if best is None or cost < best[0]:
+                            best = (cost, ArmPlan(arm, base, waist, distance))
+        if best is not None:
+            found[arm] = best[1]
+    return found
+
+
+# Local offsets where a live inverse-kinematics probe could put the cup at
+# place height with the seal down and the waist straight. Outside this window
+# the shoulder can be close while the wrist still has no solution.
+_PLACE_X = (0.08, 0.16, 0.24, 0.32)
+_PLACE_Y = (0.32, 0.40, 0.44, 0.48, 0.52, 0.56)
+
+
+def _place_local_ok(local_x, local_y):
+    if local_x >= 0.40 and local_y >= 0.48:
+        return False
+    if local_x >= 0.32 and local_y >= 0.56:
+        return False
+    return True
+
+
+@lru_cache(maxsize=None)
+def _arm_options(x, y, reach):
+    """Chassis pose that puts the slot inside the measured downward workspace."""
+    del reach
+    found = {}
+    for arm, sign in (("left", 1.0), ("right", -1.0)):
+        best = None
+        for yaw in SIDE_YAWS:
+            for local_x in _PLACE_X:
+                for local_y in _PLACE_Y:
+                    if not _place_local_ok(local_x, local_y):
+                        continue
+                    dx, dy = _rotate(local_x, sign * local_y, yaw)
+                    base = (x - dx, y - dy, yaw)
+                    if not base_is_clear(base):
+                        continue
+                    sx, sy = shoulder_world(base, arm, 0.0)
+                    distance = math.hypot(x - sx, y - sy)
+                    cost = abs(local_x - 0.16) + abs(local_y - 0.44)
+                    if best is None or cost < best[0]:
+                        best = (cost, ArmPlan(arm, base, 0.0, distance))
+        if best is not None:
+            found[arm] = best[1]
+    return found
+
+
+def arm_options(x, y, reach=PLACE_REACH):
+    return dict(_arm_options(float(x), float(y), float(reach)))
+
+
+def either_arm_reaches(x, y, reach=PLACE_REACH):
+    return bool(_arm_options(float(x), float(y), float(reach)))
+
+
+def pallet_slots(reach=PLACE_REACH, **kwargs):
+    """Slots either arm can fill, one full layer before the next.
+
+    The centered 3x3 is kept wherever a chassis pose exists. The pallet-center
+    cell has no such pose: both shoulders stay about 0.64 m away while the
+    cup is pointing down. Inside a layer the far row is filled first.
+    """
+    del kwargs
+    slots = [slot for slot in all_slots() if either_arm_reaches(slot.x, slot.y, reach)]
     slots.sort(key=lambda slot: (slot.layer, -slot.y, slot.x))
     return [Slot(index, slot.layer, slot.x, slot.y, slot.z, slot.rotated) for index, slot in enumerate(slots)]
 
 
-def unreachable_slots(reach=REACH_M, **kwargs):
-    return [slot for slot in all_slots() if not slot_is_reachable(slot, reach=reach, **kwargs)]
+def unreachable_slots(reach=PLACE_REACH, **kwargs):
+    del kwargs
+    return [slot for slot in all_slots() if not either_arm_reaches(slot.x, slot.y, reach)]
+
+
+def carry_pairs(slots, reach=PLACE_REACH):
+    """Pair slots so the two hands can pick, drive, and place in order.
+
+    Place order stays far-row first. A pair is two slots that different arms
+    can reach. A slot the other arm cannot reach is placed alone.
+    """
+    pending = []
+    for slot in slots:
+        options = arm_options(slot.x, slot.y, reach)
+        if options:
+            pending.append((slot, options))
+    used = set()
+    pairs = []
+    for index, (slot, options) in enumerate(pending):
+        if index in used:
+            continue
+        ranked = sorted(options, key=lambda arm: options[arm].distance)
+        partner = None
+        chosen = None
+        for arm in ranked:
+            other = "right" if arm == "left" else "left"
+            for later in range(index + 1, len(pending)):
+                if later in used:
+                    continue
+                if other in pending[later][1]:
+                    partner = later
+                    chosen = arm
+                    break
+            if partner is not None:
+                break
+        used.add(index)
+        if partner is None:
+            pairs.append([(slot, options[ranked[0]])])
+            continue
+        used.add(partner)
+        other = "right" if chosen == "left" else "left"
+        other_slot, other_options = pending[partner]
+        pairs.append([(slot, options[chosen]), (other_slot, other_options[other])])
+    return pairs
+
+
+@lru_cache(maxsize=None)
+def pick_plan(arm):
+    """Chassis pose that puts this cup over the pickup stand.
+
+    The left cup already picks from the spawn pose. The right cup uses the
+    mirror of that pose, facing the stand from the east, with the same
+    shoulder distance. A searched stop either sat on the bench or folded the
+    right arm into the waist.
+    """
+    stand_x, stand_y = PICKUP_XY
+    if arm == "left":
+        base = (0.0, 0.0, 0.0)
+    else:
+        # Spawn sees the stand at about (0.55, +0.18). The right shoulder is
+        # the mirror, so the stand has to sit at (0.55, -0.18) in the base.
+        yaw = math.pi
+        dx, dy = _rotate(0.55, -0.18, yaw)
+        base = (stand_x - dx, stand_y - dy, yaw)
+    sx, sy = shoulder_world(base, arm, 0.0)
+    distance = math.hypot(stand_x - sx, stand_y - sy)
+    return ArmPlan(arm, base, 0.0, distance)
+
+
+def _segment_clear(a, b):
+    """True when the chassis can drive from ``a`` to ``b`` without a keep-out.
+
+    Home sits against the pickup stand, so the footprint model marks that
+    parked pose as touching it. The first and last 30 cm of a segment that
+    begins or ends on such a pose are allowed. A pallet crossing in between
+    is not.
+    """
+    length = math.hypot(b[0] - a[0], b[1] - a[1])
+    steps = max(1, int(length / 0.08))
+    depart = 0.30 if not base_is_clear(a) else 0.0
+    arrive = 0.30 if not base_is_clear(b) else 0.0
+    for index in range(steps + 1):
+        fraction = index / steps
+        travelled = length * fraction
+        if travelled <= depart or length - travelled <= arrive:
+            continue
+        pose = (
+            a[0] + (b[0] - a[0]) * fraction,
+            a[1] + (b[1] - a[1]) * fraction,
+            a[2] if fraction < 0.5 else b[2],
+        )
+        if not base_is_clear(pose):
+            return False
+    return True
+
+
+def route_around(start, goal):
+    """Waypoints that reach ``goal`` without driving the chassis across the pallet.
+
+    ``start`` and ``goal`` are (x, y, yaw). The direct line is used when it
+    stays clear. Otherwise the chassis follows gates west, south, and north of
+    the pallet and the pickup stand. The stand sits in front of the pallet, so
+    the east side is reached by going south of the stand first.
+    """
+    if _segment_clear(start, goal):
+        return [goal]
+    pad = BASE_HALF[0] + BASE_HALF[1] + BASE_MARGIN + 0.08
+    pallet_x, pallet_y, pallet_w, pallet_h = _keep_out_rects()[0]
+    stand_x, stand_y, stand_w, stand_h = _keep_out_rects()[1]
+    west = pallet_x - pad
+    east = max(pallet_x + pallet_w, stand_x + stand_w) + pad
+    south = min(pallet_y, stand_y) - pad
+    north = max(pallet_y + pallet_h, stand_y + stand_h) + pad
+    gates = (
+        (west, start[1], start[2]),
+        (west, south, start[2]),
+        (start[0], south, start[2]),
+        (east, south, start[2]),
+        (east, north, goal[2]),
+        (west, north, goal[2]),
+        (east, goal[1], goal[2]),
+        (west, goal[1], goal[2]),
+    )
+    nodes = (start, goal, *gates)
+    count = len(nodes)
+    adjacency = [[] for _ in range(count)]
+    for left in range(count):
+        for right in range(count):
+            if left == right:
+                continue
+            if math.hypot(nodes[left][0] - nodes[right][0], nodes[left][1] - nodes[right][1]) < 1.0e-3:
+                continue
+            if _segment_clear(nodes[left], nodes[right]):
+                adjacency[left].append(right)
+    distance = [float("inf")] * count
+    previous = [-1] * count
+    distance[0] = 0.0
+    pending = {0}
+    while pending:
+        current = min(pending, key=lambda index: distance[index])
+        pending.remove(current)
+        if current == 1:
+            break
+        for nxt in adjacency[current]:
+            step = math.hypot(nodes[nxt][0] - nodes[current][0], nodes[nxt][1] - nodes[current][1])
+            candidate = distance[current] + step
+            if candidate < distance[nxt]:
+                distance[nxt] = candidate
+                previous[nxt] = current
+                pending.add(nxt)
+    if previous[1] < 0 and distance[1] == float("inf"):
+        return [goal]
+    path = []
+    cursor = 1
+    while cursor > 0:
+        path.append(nodes[cursor])
+        cursor = previous[cursor]
+    path.reverse()
+    return path
 
 
 # ---------------------------------------------------------------------------

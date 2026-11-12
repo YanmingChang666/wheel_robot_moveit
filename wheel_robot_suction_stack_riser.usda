@@ -2,21 +2,157 @@
 (
     defaultPrim = "World"
     metersPerUnit = 1
-    upAxis = "Z"
     subLayers = [
         @./wheel_robot_suction_stack.usd@
     ]
+    upAxis = "Z"
 )
 
 def Cube "PalletRiser" (
     prepend apiSchemas = ["PhysicsCollisionAPI"]
 )
 {
-    double size = 1
     float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
-    color3f[] primvars:displayColor = [(0.62, 0.47, 0.3)]
     bool physics:collisionEnabled = 1
-    double3 xformOp:translate = (0.00150, 1.12140, 0.16500)
-    float3 xformOp:scale = (1.20000, 1.00000, 0.08000)
+    color3f[] primvars:displayColor = [(0.62, 0.47, 0.3)]
+    double size = 1
+    float3 xformOp:scale = (1.2, 1, 0.08)
+    double3 xformOp:translate = (0.0015, 1.1214, 0.165)
     uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
 }
+
+over "Render" (
+    hide_in_stage_window = true
+)
+{
+}
+
+over "ActionGraph"
+{
+    def OmniGraphNode "suction_holding_pub_right"
+    {
+        custom uint64 inputs:context
+        prepend uint64 inputs:context.connect = </ActionGraph/ros2_context.outputs:context>
+        custom bool inputs:data
+        custom uint inputs:execIn (
+            customData = {
+                bool isExecution = 1
+            }
+        )
+        prepend uint inputs:execIn.connect = </ActionGraph/on_playback_tick.outputs:tick>
+        custom string inputs:messageName = "Bool"
+        custom string inputs:messagePackage = "std_msgs"
+        custom string inputs:messageSubfolder = "msg"
+        custom string inputs:nodeNamespace
+        custom string inputs:qosProfile
+        custom uint64 inputs:queueSize
+        custom string inputs:topicName = "right_suction_holding"
+        token node:type = "isaacsim.ros2.bridge.ROS2Publisher"
+        int node:typeVersion = 1
+        custom uint outputs:execOut (
+            customData = {
+                bool isExecution = 1
+            }
+        )
+    }
+
+    over "suction_command"
+    {
+        custom string inputs:script = '''import omni.graph.core as og
+import omni.usd
+
+PREVIOUS = {}
+
+ARMS = (
+    ("left", "/ActionGraph/suction_left_sub", "/wheel_robot/tool0_L/suction_cup",
+     "/ActionGraph/suction_left_close", "/ActionGraph/suction_left_open"),
+    ("right", "/ActionGraph/suction_right_sub", "/wheel_robot/tool0_R/suction_cup",
+     "/ActionGraph/suction_right_close", "/ActionGraph/suction_right_open"),
+)
+
+
+def _pulse(path):
+    node = og.Controller.node(path)
+    if not node.is_valid():
+        return
+    impulse = node.get_attribute("state:enableImpulse")
+    if impulse.is_valid():
+        impulse.set(True)
+    node.request_compute()
+
+
+def _ros_closed(node_path):
+    node = og.Controller.node(node_path)
+    if not node.is_valid():
+        return None
+    data = node.get_attribute("outputs:data")
+    if not data.is_valid():
+        return None
+    return bool(data.get())
+
+
+def _prim_closed(prim_path):
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return None
+    attr = prim.GetAttribute("suctionClosed")
+    if not attr.IsValid() or not attr.HasAuthoredValue():
+        return None
+    return bool(attr.Get())
+
+
+def _on_change(key, value, close_path, open_path):
+    if value is None:
+        return
+    seen = key in PREVIOUS
+    last = PREVIOUS.get(key)
+    PREVIOUS[key] = value
+    if not seen or last == value:
+        return
+    _pulse(close_path if value else open_path)
+
+
+# onStep must come from an OnImpulseEvent. When a grip lets go, the
+# SurfaceGripper writes state:enableImpulse on whatever feeds onStep.
+# on_playback_tick has no such attribute, so the second grip aborts.
+STEP = (
+    "/ActionGraph/suction_left_step",
+    "/ActionGraph/suction_right_step",
+)
+
+
+
+def _publish_holding():
+    pairs = (
+        ("/ActionGraph/suction_left", "/ActionGraph/suction_holding_pub"),
+        ("/ActionGraph/suction_right", "/ActionGraph/suction_holding_pub_right"),
+    )
+    for grip_path, pub_path in pairs:
+        grip = og.Controller.node(grip_path)
+        pub = og.Controller.node(pub_path)
+        if not grip.is_valid() or not pub.is_valid():
+            continue
+        closed = grip.get_attribute("outputs:Closed")
+        data = pub.get_attribute("inputs:data")
+        if not closed.is_valid() or not data.is_valid():
+            continue
+        try:
+            data.set(bool(closed.get()))
+        except Exception:
+            continue
+
+
+def compute(db):
+    for path in STEP:
+        _pulse(path)
+    for key, subscriber, prim_path, close_path, open_path in ARMS:
+        _on_change(key + "_ros", _ros_closed(subscriber), close_path, open_path)
+        _on_change(key + "_prim", _prim_closed(prim_path), close_path, open_path)
+    _publish_holding()
+    return True
+'''
+        custom bool state:omni_initialized = 0
+    }
+}
+

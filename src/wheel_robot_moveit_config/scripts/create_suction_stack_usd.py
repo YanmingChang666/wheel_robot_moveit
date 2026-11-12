@@ -67,6 +67,36 @@ def _publish_ready():
         return
 
 
+def _publish_poses():
+    # World center of every box prim. The planner treats these as the real
+    # obstacles; the nominal slot is only the target before the box settles.
+    stage = omni.usd.get_context().get_stage()
+    pub = og.Controller.node("/ActionGraph/stack_pose_pub")
+    if stage is None or not pub.is_valid():
+        return
+    data = pub.get_attribute("inputs:data")
+    if not data.is_valid():
+        return
+    parts = []
+    index = 0
+    while index < 40:
+        prim = stage.GetPrimAtPath(f"/World/stack/box_{{index}}")
+        if not prim.IsValid():
+            break
+        translation = omni.usd.get_world_transform_matrix(prim).ExtractTranslation()
+        rotation = omni.usd.get_world_transform_matrix(prim).ExtractRotationQuat()
+        imaginary = rotation.GetImaginary()
+        parts.append(
+            f"{{index}}:{{translation[0]:.4f}},{{translation[1]:.4f}},{{translation[2]:.4f}},"
+            f"{{imaginary[0]:.5f}},{{imaginary[1]:.5f}},{{imaginary[2]:.5f}},{{rotation.GetReal():.5f}}"
+        )
+        index += 1
+    try:
+        data.set(";".join(parts))
+    except Exception:
+        return
+
+
 def _spawn(index):
     stage = omni.usd.get_context().get_stage()
     path = f"/World/stack/box_{{index}}"
@@ -94,6 +124,7 @@ def compute(db):
             READY = requested
         BASELINE = requested
     _publish_ready()
+    _publish_poses()
     return True
 '''
 
@@ -168,7 +199,7 @@ def _build(stage):
     _cube(stage, "/World/stack/stand", stand_center(), STAND_SIZE, (0.35, 0.35, 0.38), False)
     _cube(stage, "/World/stack/box_0", spawn_center(), BOX, (0.72, 0.55, 0.32), True)
 
-    for name in ("stack_spawn_sub", "stack_ready_pub", "stack_spawner"):
+    for name in ("stack_spawn_sub", "stack_ready_pub", "stack_pose_pub", "stack_spawner"):
         path = "/ActionGraph/" + name
         if stage.GetPrimAtPath(path).IsValid():
             stage.RemovePrim(path)
@@ -180,6 +211,7 @@ def _build(stage):
             keys.CREATE_NODES: [
                 ("stack_spawn_sub", "isaacsim.ros2.bridge.ROS2Subscriber"),
                 ("stack_ready_pub", "isaacsim.ros2.bridge.ROS2Publisher"),
+                ("stack_pose_pub", "isaacsim.ros2.bridge.ROS2Publisher"),
                 ("stack_spawner", "omni.graph.scriptnode.ScriptNode"),
             ],
             keys.SET_VALUES: [
@@ -191,6 +223,10 @@ def _build(stage):
                 ("stack_ready_pub.inputs:messageSubfolder", "msg"),
                 ("stack_ready_pub.inputs:messageName", "Int32"),
                 ("stack_ready_pub.inputs:topicName", "stack_box_ready"),
+                ("stack_pose_pub.inputs:messagePackage", "std_msgs"),
+                ("stack_pose_pub.inputs:messageSubfolder", "msg"),
+                ("stack_pose_pub.inputs:messageName", "String"),
+                ("stack_pose_pub.inputs:topicName", "stack_box_poses"),
                 ("stack_spawner.inputs:usePath", False),
                 ("stack_spawner.inputs:script", SPAWN_SCRIPT),
             ],
@@ -205,9 +241,11 @@ def _build(stage):
     links = [
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/stack_spawn_sub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/stack_ready_pub.inputs:execIn"),
+        ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/stack_pose_pub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/stack_spawner.inputs:execIn"),
         ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/stack_spawn_sub.inputs:context"),
         ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/stack_ready_pub.inputs:context"),
+        ("/ActionGraph/ros2_context.outputs:context", "/ActionGraph/stack_pose_pub.inputs:context"),
     ]
     for source, destination in links:
         _connect(stage, source, destination)
