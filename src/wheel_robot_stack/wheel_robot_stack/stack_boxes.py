@@ -113,6 +113,7 @@ class StackBoxes(Node):
         self.holding = False
         self.place_path = []
         self.pick_clearance = False
+        self.place_supports = set()
         self.base_pose = None
         self.home_pose = None
         self.steer_hold = [0.0, 0.0, 0.0, 0.0]
@@ -435,15 +436,32 @@ class StackBoxes(Node):
             return False
         self._sync_scene()
         sx, sy = self._into_base(slot.x, slot.y)
+        self.place_supports = {"stand", "pallet"}
+        for name, center, _size in self.world_boxes:
+            if not name.startswith("placed_"):
+                continue
+            if math.hypot(center[0] - slot.x, center[1] - slot.y) < 0.04 and center[2] < slot.z - 0.04:
+                self.place_supports.add(name)
+        self._publish_collision_matrix()
+        self.get_logger().info(
+            f"格子 {slot.index} 支撑 {sorted(self.place_supports)}，"
+            f"放置目标 ({sx:.3f}, {sy:.3f}, {place_z:.3f})"
+        )
         if not self._move_tool(sx, sy, place_z + APPROACH_HEIGHT, "放置上方"):
+            return False
+        if not self._settle_over(sx, sy, place_z + APPROACH_HEIGHT, "放置上方", 0.015):
             return False
         self.place_path = []
         self._record_place_waypoint()
         if not self._move_tool(sx, sy, place_z, "放置"):
             return False
-        self.set_suction(False)
-        self.sleep(0.6)
-        settled = (slot.x, slot.y, slot.support_z + BOX[2] / 2.0)
+        if not self._settle_over(sx, sy, place_z, "放置", 0.012):
+            self.get_logger().error("吸盘没有对准格子，箱子还悬在旁边，不释放。")
+            return False
+        released = self._release_when_settled(sx, sy, place_z)
+        if released is None:
+            return False
+        settled = (released[0], released[1], slot.support_z + BOX[2] / 2.0)
         if not self._detach_at(slot.index, settled):
             self.get_logger().error("释放后的规划场景没有确认成功，停止撤离。")
             return False
@@ -529,6 +547,12 @@ class StackBoxes(Node):
         cosine = math.cos(yaw)
         sine = math.sin(yaw)
         return cosine * dx + sine * dy, -sine * dx + cosine * dy
+
+    def _from_base(self, x, y):
+        base_x, base_y, yaw = self.base_pose
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        return base_x + cosine * x - sine * y, base_y + sine * x + cosine * y
 
     def _sync_scene(self):
         objects = []
@@ -900,10 +924,76 @@ class StackBoxes(Node):
         """Isaac often finishes the last centimetres after the controller says done."""
         end = self.get_clock().now() + Duration(seconds=timeout)
         while rclpy.ok() and self.get_clock().now() < end:
-            if self._at_tool(x, y, z, tolerance) or self._measured_tool() is None:
+            if self._at_tool(x, y, z, tolerance):
                 return True
             self.sleep(0.1)
         return False
+
+    def _place_sample(self, x, y, z):
+        pose = self._measured_tool()
+        if pose is None:
+            return None
+        current = (pose.position.x, pose.position.y, pose.position.z)
+        horizontal = math.hypot(current[0] - x, current[1] - y)
+        return current, horizontal, current[2] - z
+
+    def _wait_stopped(self, x, y, z, hold=0.8, timeout=4.0):
+        """Last sample after the tool stops moving. It may still be short of the slot."""
+        deadline = self.get_clock().now() + Duration(seconds=timeout)
+        since = None
+        previous = None
+        last = None
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            sample = self._place_sample(x, y, z)
+            if sample is None:
+                since = None
+                self.sleep(0.05)
+                continue
+            current = sample[0]
+            jumped = previous is not None and math.dist(current, previous) > 0.002
+            previous = current
+            last = sample
+            if not jumped:
+                if since is None:
+                    since = self.get_clock().now()
+                elif self.get_clock().now() - since >= Duration(seconds=hold):
+                    return sample
+            else:
+                since = None
+            self.sleep(0.05)
+        return last
+
+    def _place_pose_ok(self, horizontal, high):
+        # 2 cm is what this wrist can hold at the deck. More than that, or
+        # still above the slot, drops the box on its edge.
+        return horizontal <= 0.02 and high <= 0.012
+
+    def _release_when_settled(self, x, y, z):
+        """Open the cup once the lip has stopped and is on the slot.
+
+        Returns the world XY where the box actually is, or None to keep holding.
+        """
+        self.get_logger().info("吸盘保持，等末端停稳再松开")
+        sample = self._wait_stopped(x, y, z)
+        if sample is not None and not self._place_pose_ok(sample[1], sample[2]):
+            self.get_logger().warn(
+                f"停住后还差 横向 {sample[1] * 100:.1f} cm、高度 {sample[2] * 100:.1f} cm，再对准一次"
+            )
+            self._move_tool_direct(x, y, z, "放置对准", 0.02, False, wait=4.0)
+            sample = self._wait_stopped(x, y, z)
+        if sample is None or not self._place_pose_ok(sample[1], sample[2]):
+            self._log_tool("放置还没停稳", x, y, z)
+            self.get_logger().error("末端还没停在格子上，不释放。")
+            return None
+        current, horizontal, high = sample
+        self.get_logger().info(
+            f"放置停稳 横向 {horizontal * 100:.1f} cm，高度差 {high * 100:.1f} cm，松开"
+        )
+        world_x, world_y = self._from_base(current[0], current[1])
+        self.set_suction(False)
+        # Let the box sit on the riser before the cup lifts away.
+        self.sleep(1.0)
+        return world_x, world_y
 
     def _at_tool(self, x, y, z, tolerance=0.035):
         pose = self._measured_tool()
@@ -986,6 +1076,44 @@ class StackBoxes(Node):
         horizontal = math.hypot(x - pose.position.x, y - pose.position.y)
         return horizontal <= 0.06 and abs(z - pose.position.z) > 0.05
 
+    def _hold_xy(self, x, y, z):
+        """Stay over the slot before dropping further. A sideways lag drops the box."""
+        for _ in range(2):
+            pose = self._measured_tool()
+            if pose is None:
+                return False
+            horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+            high = pose.position.z - z
+            if horizontal <= 0.012 and high <= 0.012:
+                return True
+            self.get_logger().warn(
+                f"放置横向 {horizontal * 100:.1f} cm、偏高 {max(high, 0.0) * 100:.1f} cm，"
+                "停在这一高度再对准"
+            )
+            self._move_tool_direct(x, y, z, "放置对准", 0.012, False, wait=4.0)
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+        if horizontal > 0.012 or pose.position.z > z + 0.012:
+            self._log_tool("放置没有对准", x, y, z)
+            return False
+        return True
+
+    def _settle_over(self, x, y, z, label, tolerance):
+        """Do not open the cup until the measured lip is on this pose."""
+        for _ in range(3):
+            if self._at_tool(x, y, z, tolerance):
+                self._log_tool(f"{label} 已对准", x, y, z)
+                return True
+            self.get_logger().warn(f"{label} 还没对准，再走一次")
+            self._move_tool_direct(x, y, z, label, tolerance, False, wait=4.0)
+        if self._at_tool(x, y, z, tolerance):
+            self._log_tool(f"{label} 已对准", x, y, z)
+            return True
+        self._log_tool(f"{label} 偏差过大", x, y, z)
+        return False
+
     def _move_vertical(self, x, y, z, label):
         pose = self._measured_tool()
         cursor = pose.position.z
@@ -998,15 +1126,24 @@ class StackBoxes(Node):
         try:
             while True:
                 remaining = z - cursor
-                if abs(remaining) <= 0.045:
+                # Place creeps down. A 4 cm step finishes in the controller
+                # while the box is still in the air, and the cup lets go early.
+                step = 0.02 if label == "放置" else 0.04
+                if abs(remaining) <= step + 0.005:
                     target_z = z
                 else:
-                    target_z = cursor + direction * 0.04
+                    target_z = cursor + direction * step
                 # The last downward step has to put the lip on the cardboard.
                 # 2.5 cm still allows the cup to stop on the surface instead of
                 # sinking the full press into the box.
                 tolerance = 0.025 if direction < 0 and abs(target_z - z) <= 1e-4 else 0.035
-                if not self._move_tool_direct(x, y, target_z, label, tolerance, False):
+                if label == "放置":
+                    tolerance = 0.012 if abs(target_z - z) <= 1e-4 else 0.018
+                reached = self._move_tool_direct(x, y, target_z, label, tolerance, False)
+                if label == "放置":
+                    if not self._hold_xy(x, y, target_z):
+                        return False
+                elif not reached:
                     return False
                 if label == "放置":
                     self._record_place_waypoint()
@@ -1038,6 +1175,11 @@ class StackBoxes(Node):
             arm_only = {name: solved[name] for name in ARM_LIMITS}
             if not self._move_torso(solved["linear_Link"]):
                 return False
+            # The second box is a short drop. Full speed ends the trajectory
+            # before Isaac's arm arrives, and the cup opens on the way down.
+            velocity = 0.05 if str(label).startswith("放置") else 0.15
+            if str(label).startswith("放置"):
+                wait = max(wait, 4.0)
             constraints = Constraints()
             for name, value in arm_only.items():
                 joint = JointConstraint()
@@ -1055,13 +1197,18 @@ class StackBoxes(Node):
                 return True
             # -2 is an empty plan. Accept it only when the measured tool is
             # already on the target; otherwise the arm never left the last pose.
-            if self._move("left_arm", constraints) or self._at_tool(x, y, z, tolerance):
+            if self._move("left_arm", constraints, velocity) or self._at_tool(x, y, z, tolerance):
                 if self._wait_tool(x, y, z, wait, tolerance):
                     self.arm_seed = dict(arm_only)
                     self._log_tool(label, x, y, z)
                     return True
-                # Carrying: accept a few centimetres of lag if the box is clearly up.
-                if self.holding and self._at_tool(x, y, z, tolerance + 0.02):
+                # Carry may lag a little. Placement must not: a 4 cm miss
+                # drops the box beside the previous one.
+                if (
+                    self.holding
+                    and not label.startswith("放置")
+                    and self._at_tool(x, y, z, tolerance + 0.02)
+                ):
                     self._log_tool(label, x, y, z)
                     self.get_logger().warn(f"{label} 跟踪略慢，按到位继续")
                     return True
@@ -1105,7 +1252,8 @@ class StackBoxes(Node):
         constraints.orientation_constraints = [orientation]
         self.get_logger().warn(f"{label} 没有找到无碰撞逆解，改用位姿约束")
         self.get_logger().info(f"{label} ({x:.3f}, {y:.3f}, {z:.3f})")
-        return self._move("left_arm", constraints)
+        velocity = 0.05 if str(label).startswith("放置") else 0.15
+        return self._move("left_arm", constraints, velocity)
 
     def _arm_at(self, joints, tolerance):
         for name, value in joints.items():
@@ -1114,9 +1262,9 @@ class StackBoxes(Node):
                 return False
         return True
 
-    def _move(self, group, constraints):
+    def _move(self, group, constraints, velocity=0.15):
         for attempt in range(3):
-            code = self._move_once(group, constraints)
+            code = self._move_once(group, constraints, velocity)
             if code == MoveItErrorCodes.SUCCESS:
                 return True
             # -4 is CONTROL_FAILED: the trajectory was dropped before the arm moved,
@@ -1135,14 +1283,14 @@ class StackBoxes(Node):
             self.sleep(0.4)
         return False
 
-    def _move_once(self, group, constraints):
+    def _move_once(self, group, constraints, velocity=0.15):
         goal = MoveGroup.Goal()
         request = goal.request
         request.group_name = group
         request.num_planning_attempts = 10
         request.allowed_planning_time = 8.0
-        request.max_velocity_scaling_factor = 0.15
-        request.max_acceleration_scaling_factor = 0.15
+        request.max_velocity_scaling_factor = velocity
+        request.max_acceleration_scaling_factor = velocity
         request.planner_id = "RRTConnectkConfigDefault"
         request.start_state.is_diff = True
         request.goal_constraints = [constraints]
@@ -1218,15 +1366,23 @@ class StackBoxes(Node):
             enabled = []
             for other in names:
                 adjacent = (name, other) in self._srdf_allowed
-                cup_on_object = (name in links and other in self.scene_ids) or (
-                    other in links and name in self.scene_ids
+                # While a box is on the cup, the wrist may touch only the
+                # stand, the pallet, and the box directly underneath. Neighbors
+                # stay solid so a drifted descent cannot sink into them.
+                # After release the cup starts on the box it just set down, so
+                # the open hand is allowed against every scene box again.
+                cup_targets = self.place_supports if self.holding else self.scene_ids
+                cup_on_object = (name in links and other in cup_targets) or (
+                    other in links and name in cup_targets
                 )
-                # The grasped box starts sitting on the stand. That contact is
-                # the pick, not a collision that should cancel the lift.
-                held = (name == "carried" and other in self.scene_ids + links) or (
-                    other == "carried" and name in self.scene_ids + links
+                held_on_support = (
+                    (name == "carried" and other in self.place_supports)
+                    or (other == "carried" and name in self.place_supports)
                 )
-                enabled.append(adjacent or cup_on_object or held)
+                held_on_hand = (name == "carried" and other in links) or (
+                    other == "carried" and name in links
+                )
+                enabled.append(adjacent or cup_on_object or held_on_support or held_on_hand)
             entry.enabled = enabled
             matrix.entry_values.append(entry)
         scene = PlanningScene()
@@ -1262,7 +1418,10 @@ class StackBoxes(Node):
         carried.id = "carried"
         primitive = SolidPrimitive()
         primitive.type = SolidPrimitive.BOX
-        primitive.dimensions = [BOX[0], BOX[1], BOX[2]]
+        # 2 cm inset on each side. Packed slots share a face, so a full-size
+        # carried box touches its neighbors even when it is centered. The inset
+        # still blocks a descent that has drifted more than 2 cm into one.
+        primitive.dimensions = [BOX[0] - 0.04, BOX[1] - 0.04, BOX[2]]
         pose = Pose()
         # Box center is along tool +Z. Rx(180) keeps the box upright in the world.
         pose.position.z = carried_offset()
@@ -1283,6 +1442,7 @@ class StackBoxes(Node):
         if not self._call_scene(scene):
             return
         self.holding = True
+        self.place_supports = {"stand", "pallet"}
         self.world_boxes = [item for item in self.world_boxes if item[0] != "pickup"]
         if "pickup" in self.scene_ids:
             self.scene_ids.remove("pickup")

@@ -1,0 +1,22 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+    subLayers = [
+        @./wheel_robot_suction_stack.usd@
+    ]
+)
+
+def Cube "PalletRiser" (
+    prepend apiSchemas = ["PhysicsCollisionAPI"]
+)
+{
+    double size = 1
+    float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+    color3f[] primvars:displayColor = [(0.62, 0.47, 0.3)]
+    bool physics:collisionEnabled = 1
+    double3 xformOp:translate = (0.00150, 1.12140, 0.16500)
+    float3 xformOp:scale = (1.20000, 1.00000, 0.08000)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+}

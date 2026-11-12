@@ -83,7 +83,18 @@ def _on_change(key, value, close_path, open_path):
     _pulse(close_path if value else open_path)
 
 
+# onStep must come from an OnImpulseEvent. When a grip lets go, the
+# SurfaceGripper writes state:enableImpulse on whatever feeds onStep.
+# on_playback_tick has no such attribute, so the second grip aborts.
+STEP = (
+    "/ActionGraph/suction_left_step",
+    "/ActionGraph/suction_right_step",
+)
+
+
 def compute(db):
+    for path in STEP:
+        _pulse(path)
     for key, subscriber, prim_path, close_path, open_path in ARMS:
         _on_change(key + "_ros", _ros_closed(subscriber), close_path, open_path)
         _on_change(key + "_prim", _prim_closed(prim_path), close_path, open_path)
@@ -271,8 +282,10 @@ def _graph(stage):
                 ("suction_right", "isaacsim.robot.surface_gripper.SurfaceGripper"),
                 ("suction_left_close", "omni.graph.action.OnImpulseEvent"),
                 ("suction_left_open", "omni.graph.action.OnImpulseEvent"),
+                ("suction_left_step", "omni.graph.action.OnImpulseEvent"),
                 ("suction_right_close", "omni.graph.action.OnImpulseEvent"),
                 ("suction_right_open", "omni.graph.action.OnImpulseEvent"),
+                ("suction_right_step", "omni.graph.action.OnImpulseEvent"),
                 ("suction_left_sub", "isaacsim.ros2.bridge.ROS2Subscriber"),
                 ("suction_right_sub", "isaacsim.ros2.bridge.ROS2Subscriber"),
                 ("suction_command", "omni.graph.scriptnode.ScriptNode"),
@@ -310,8 +323,8 @@ def _graph(stage):
     for _ in range(3):
         simulation_app.update()
     links = [
-        ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_left.inputs:onStep"),
-        ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_right.inputs:onStep"),
+        ("/ActionGraph/suction_left_step.outputs:execOut", "/ActionGraph/suction_left.inputs:onStep"),
+        ("/ActionGraph/suction_right_step.outputs:execOut", "/ActionGraph/suction_right.inputs:onStep"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_left_sub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_right_sub.inputs:execIn"),
         ("/ActionGraph/on_playback_tick.outputs:tick", "/ActionGraph/suction_command.inputs:execIn"),
