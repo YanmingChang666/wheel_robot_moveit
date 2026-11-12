@@ -31,6 +31,9 @@ from functools import lru_cache
 
 
 BOX = (0.351, 0.287, 0.105)
+# Free space left between neighbouring boxes. Flush faces snag during the
+# last centimetres of the lift drop and fold the arm, so the cup stops high.
+PACK_GAP = 0.015
 PALLET_FOOTPRINT = (1.200, 1.000)
 PALLET_MAX_HEIGHT = 1.080
 PALLET_THICKNESS = 0.125
@@ -201,7 +204,9 @@ def layer_count(box_z=BOX[2], max_height=PALLET_MAX_HEIGHT):
 
 def all_slots():
     """Every slot of the pattern, ignoring whether the robot can reach it."""
-    layer = pack_layer(PALLET_FOOTPRINT[0], PALLET_FOOTPRINT[1], BOX[0], BOX[1])
+    layer = pack_layer(
+        PALLET_FOOTPRINT[0], PALLET_FOOTPRINT[1], BOX[0] + PACK_GAP, BOX[1] + PACK_GAP
+    )
     slots = []
     for level in range(layer_count()):
         for x, y, width, height, rotated in layer:

@@ -32,8 +32,10 @@ from moveit_msgs.srv import (
 )
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
+from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -126,6 +128,12 @@ class StackBoxes(Node):
         self.create_subscription(JointState, "isaac_joint_states", self._on_wheels, 10)
         self.create_subscription(Odometry, "ground_truth_odom", self._on_odom, 10)
         self.move = ActionClient(self, MoveGroup, "move_action")
+        self.arm_traj = ActionClient(
+            self, FollowJointTrajectory, "/left_arm_controller/follow_joint_trajectory"
+        )
+        self.torso_traj = ActionClient(
+            self, FollowJointTrajectory, "/torso_controller/follow_joint_trajectory"
+        )
         self.scene = self.create_client(ApplyPlanningScene, "apply_planning_scene")
         self.get_scene = self.create_client(GetPlanningScene, "get_planning_scene")
         self.ik = self.create_client(GetPositionIK, "compute_ik")
@@ -385,6 +393,16 @@ class StackBoxes(Node):
         self.get_logger().info(
             f"箱顶 {box_top:.3f}，密封面贴住后工具高度 {pick_z:.3f}"
         )
+        # Seed the approach from an elbow that can actually sit on the box.
+        # The other elbow reaches the hover and then cannot descend.
+        self.pick_clearance = True
+        self._publish_collision_matrix()
+        goal = self._solve_arm(px, py, pick_z)
+        self.pick_clearance = False
+        self._publish_collision_matrix()
+        if goal is not None:
+            self.arm_seed = {name: goal[name] for name in ARM_LIMITS}
+            self.get_logger().info("取料先选定能贴住纸箱的手臂姿态")
         if not self._move_tool(px, py, pick_z + APPROACH_HEIGHT, "取料上方"):
             return False
         if not self._move_tool(px, py, pick_z, "取料"):
@@ -447,15 +465,9 @@ class StackBoxes(Node):
             f"格子 {slot.index} 支撑 {sorted(self.place_supports)}，"
             f"放置目标 ({sx:.3f}, {sy:.3f}, {place_z:.3f})"
         )
-        if not self._move_tool(sx, sy, place_z + APPROACH_HEIGHT, "放置上方"):
+        if not self._place_with_torso(sx, sy, place_z):
             return False
-        if not self._settle_over(sx, sy, place_z + APPROACH_HEIGHT, "放置上方", 0.015):
-            return False
-        self.place_path = []
-        self._record_place_waypoint()
-        if not self._move_tool(sx, sy, place_z, "放置"):
-            return False
-        if not self._settle_over(sx, sy, place_z, "放置", 0.012):
+        if not self._settle_over(sx, sy, place_z, "放置", 0.02):
             self.get_logger().error("吸盘没有对准格子，箱子还悬在旁边，不释放。")
             return False
         released = self._release_when_settled(sx, sy, place_z)
@@ -481,6 +493,25 @@ class StackBoxes(Node):
 
 
     def _retreat(self, x, y, z):
+        # The place descent moved only the lift, so the way out is the same
+        # lift coming back up. The arm joints stay in the pose that was over
+        # the slot, which keeps the cup from swinging into the stack.
+        pose = self._measured_tool()
+        if pose is not None and z - pose.position.z > 0.02:
+            self.get_logger().info("撤离只升起升降，手臂保持放下时的姿态")
+            target = min(LIFT_LIMIT, max(0.0, self._lift_now() + (z - pose.position.z)))
+            if not self._follow_lift(target, 0.04):
+                return False
+            pose = self._measured_tool()
+            if pose is None:
+                self.get_logger().error("撤离缺少末端反馈，不能确认净空")
+                return False
+            horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+            if pose.position.z >= z - 0.03 and horizontal <= 0.04:
+                self._log_tool("撤离完成", x, y, z)
+                return True
+            self._log_tool("升降撤离不够，改由手臂抬离", x, y, z)
+            return self._move_tool(x, y, z, "撤离")
         # Reuse the measured descent branch instead of asking KDL to rediscover
         # a nearby solution at the deeply folded placement pose. Each segment
         # is still planned against the scene, including the newly placed box.
@@ -740,6 +771,212 @@ class StackBoxes(Node):
                 return False
         return True
 
+    def _follow_joints(self, client, names, targets, speed, label, finish=True):
+        """Straight smoothstep in joint space. RRT between tiny goals is what wobbles."""
+        if not client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().error(f"没有连上{label}轨迹，不能平滑运动")
+            return False
+        current = []
+        for name in names:
+            value = self._joint_position(name)
+            if value is None:
+                self.get_logger().error(f"{label}缺少关节 {name}")
+                return False
+            current.append(value)
+        goal_pos = [float(targets[name]) for name in names]
+        delta = max(abs(start - end) for start, end in zip(current, goal_pos))
+        if delta < 0.004:
+            return True
+        duration = max(1.2, delta / speed)
+        steps = max(6, int(duration / 0.15))
+        trajectory = JointTrajectory()
+        trajectory.joint_names = list(names)
+        for index in range(1, steps + 1):
+            fraction = index / steps
+            smooth = fraction * fraction * (3.0 - 2.0 * fraction)
+            point = JointTrajectoryPoint()
+            point.positions = [
+                start + (end - start) * smooth for start, end in zip(current, goal_pos)
+            ]
+            point.time_from_start.sec = int(duration * fraction)
+            point.time_from_start.nanosec = int((duration * fraction % 1.0) * 1e9)
+            trajectory.points.append(point)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = trajectory
+        self.get_logger().info(f"{label}平滑运动 {duration:.1f} 秒，幅度 {delta:.3f}")
+        send = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self, send)
+        handle = send.result()
+        if handle is None or not handle.accepted:
+            self.get_logger().error(f"{label}轨迹被拒绝")
+            return False
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(self, result_future)
+        wrapped = result_future.result()
+        if wrapped is None or wrapped.result.error_code != 0:
+            code = None if wrapped is None else wrapped.result.error_code
+            self.get_logger().error(f"{label}轨迹没有走完，错误码 {code}")
+            return False
+        # Goal tolerance can report success while a joint is still several
+        # degrees short. One short extra move finishes that last bit.
+        leftover = 0.0
+        for name in names:
+            value = self._joint_position(name)
+            if value is not None:
+                leftover = max(leftover, abs(value - targets[name]))
+        if finish and leftover > 0.03:
+            return self._follow_joints(client, names, targets, max(speed * 0.5, 0.02), label, False)
+        return True
+
+    def _follow_lift(self, lift, speed):
+        pitch = self._joint_position("waist_pitch_Link")
+        yaw = self._joint_position("waist_yaw_Link")
+        targets = {
+            "linear_Link": min(LIFT_LIMIT, max(0.0, float(lift))),
+            "waist_pitch_Link": 0.0 if pitch is None else pitch,
+            "waist_yaw_Link": 0.0 if yaw is None else yaw,
+        }
+        return self._follow_joints(
+            self.torso_traj,
+            ("linear_Link", "waist_pitch_Link", "waist_yaw_Link"),
+            targets,
+            speed,
+            "升降",
+        )
+
+    def _follow_arm(self, joints, speed):
+        return self._follow_joints(self.arm_traj, tuple(ARM_LIMITS), joints, speed, "手臂")
+
+    def _place_with_torso(self, x, y, z):
+        """Hover with one smooth arm move, then drop by the lift alone.
+
+        Re-solving the arm every few centimetres is what made the cup wobble
+        and release early. The lift axis is base Z, so a fixed arm goes
+        straight down.
+        """
+        hover_z = z + APPROACH_HEIGHT
+        solved = None
+        lift_hover = None
+        # Highest lift that can still reach this slot wins: the descent is then
+        # only the prismatic joint. A far column cannot reach while the lift is high.
+        for candidate in (0.28, 0.20, 0.12, 0.06, 0.0):
+            solved = self._solve_arm(x, y, hover_z, fixed_lift=candidate)
+            if solved is not None:
+                lift_hover = candidate
+                break
+        if solved is None:
+            for candidate in (0.12, 0.06, 0.0, 0.20):
+                solved = self._solve_arm(x, y, z, fixed_lift=candidate)
+                if solved is not None:
+                    lift_hover = candidate
+                    hover_z = z
+                    self.get_logger().info("上方没有逆解，直接平滑到放置高度")
+                    break
+        if solved is None:
+            self.get_logger().warn("升降上没有逆解，退回手臂分段放下")
+            if not self._move_tool(x, y, z + APPROACH_HEIGHT, "放置上方"):
+                return False
+            return self._move_tool(x, y, z, "放置")
+        self.get_logger().info(
+            f"放置升到 {lift_hover:.3f} 后只降升降，目标高度 {z:.3f}"
+        )
+        if not self._follow_lift(lift_hover, 0.08):
+            return False
+        if not self._follow_arm(solved, 0.3):
+            return False
+        self.arm_seed = {name: solved[name] for name in ARM_LIMITS}
+        if not self._wait_tool(x, y, hover_z, 3.0, 0.03):
+            self._log_tool("放置上方", x, y, hover_z)
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        lift_fix = self._lift_now() + (hover_z - pose.position.z)
+        lift_fix = min(LIFT_LIMIT, max(0.0, lift_fix))
+        if abs(lift_fix - self._lift_now()) > 0.01 and not self._follow_lift(lift_fix, 0.05):
+            return False
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+        if horizontal > 0.015:
+            self.get_logger().warn(f"到位后横向还差 {horizontal * 100:.1f} cm，手臂微调一次")
+            self._move_tool_direct(x, y, pose.position.z, "放置对准", 0.015, False, wait=4.0)
+            pose = self._measured_tool()
+            if pose is None:
+                return False
+            horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+            if horizontal > 0.02:
+                self._log_tool("放置上方偏差过大", x, y, hover_z)
+                return False
+        self.place_path = []
+        self._record_place_waypoint()
+        self.get_logger().info(f"升降分步放到 {z:.3f}，偏了就先拉回再降")
+        # One long lift move lets a brush against the previous box fold the arm
+        # and the cup finishes centimetres high. Short steps stop that early.
+        for _ in range(16):
+            pose = self._measured_tool()
+            if pose is None:
+                return False
+            horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+            high = pose.position.z - z
+            self._log_tool("放置", x, y, z)
+            if horizontal <= 0.018 and abs(high) <= 0.008:
+                self._record_place_waypoint()
+                return True
+            # Under 2 cm is already inside the release gate. Nudging a
+            # fully stretched arm here never closes the last centimetre
+            # and blocks the lift drop.
+            if horizontal > 0.018:
+                aim_z = z if high < 0.025 else pose.position.z
+                if not self._aim_arm(x, y, aim_z, pose.position.z):
+                    break
+                continue
+            if high <= 0.008:
+                break
+            step = min(0.03, high)
+            target_lift = self._lift_now() - step
+            if target_lift < 0.0:
+                if self._lift_now() > 0.008 and not self._follow_lift(0.0, 0.03):
+                    return False
+                self.get_logger().info("升降已到最低，剩下的高度由手臂平滑补上")
+                if not self._aim_arm(x, y, z, pose.position.z):
+                    break
+                continue
+            before_z = pose.position.z
+            if not self._follow_lift(max(0.0, target_lift), 0.03):
+                return False
+            pose = self._measured_tool()
+            if pose is None:
+                return False
+            dropped = before_z - pose.position.z
+            if dropped < 0.5 * step:
+                self.get_logger().warn(
+                    f"升降降了 {step * 100:.1f} cm，末端只降了 {dropped * 100:.1f} cm，改由手臂下降"
+                )
+                if not self._aim_arm(x, y, z, pose.position.z):
+                    break
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+        high = pose.position.z - z
+        if horizontal <= 0.02 and high <= 0.012:
+            self._record_place_waypoint()
+            return True
+        self._log_tool("放置偏差过大", x, y, z)
+        return False
+
+    def _aim_arm(self, x, y, z, fallback_z):
+        """Smooth arm move at the current lift. Tries the target height first."""
+        lift = self._lift_now()
+        solved = self._solve_arm(x, y, z, fixed_lift=lift)
+        if solved is None and abs(z - fallback_z) > 0.005:
+            solved = self._solve_arm(x, y, fallback_z, fixed_lift=lift)
+        if solved is None:
+            self.get_logger().warn("放下时手臂没有逆解")
+            return False
+        return self._follow_arm(solved, 0.22)
+
     def _current_arm(self):
         if self.joint_state is None:
             return None
@@ -789,7 +1026,7 @@ class StackBoxes(Node):
         state.position = positions
         return state
 
-    def _solve_arm(self, x, y, z, max_joint_delta=None):
+    def _solve_arm(self, x, y, z, max_joint_delta=None, fixed_lift=None, prefer=None):
         """Pick a collision-free left-arm solution for a downward tool pose.
 
         A pose constraint makes MoveIt seed inverse kinematics from the current
@@ -817,16 +1054,22 @@ class StackBoxes(Node):
             seeds.append(current)
         for _ in range(6):
             seeds.append({name: random.uniform(low, high) for name, (low, high) in ARM_LIMITS.items()})
-        reference = current or self.arm_seed or {name: 0.0 for name in ARM_LIMITS}
+        reference = prefer or current or self.arm_seed or {name: 0.0 for name in ARM_LIMITS}
         preferred = lift_for_tool_z(z)
         # Stay at the current lift for the vertical approach and retreat.
         # Changing it between the pick and the lift-off is what produced the
         # empty torso plan.
-        current_lift = min(LIFT_LIMIT, max(0.0, self._lift_now()))
-        lifts = [current_lift]
-        for value in self._candidate_lifts(z):
-            if all(abs(value - other) > 0.03 for other in lifts):
-                lifts.append(value)
+        if fixed_lift is not None:
+            lifts = [min(LIFT_LIMIT, max(0.0, float(fixed_lift)))]
+        else:
+            current_lift = min(LIFT_LIMIT, max(0.0, self._lift_now()))
+            # While a box is on the cup, changing the lift between two short
+            # moves is what makes the next inverse solution disappear.
+            lifts = [current_lift]
+            if not self.holding:
+                for value in self._candidate_lifts(z):
+                    if all(abs(value - other) > 0.03 for other in lifts):
+                        lifts.append(value)
         rejected = {"ik": 0, "collision": 0, "fk": 0, "joint_delta": 0}
         for lift_index, lift in enumerate(lifts):
             arm_seeds = seeds if lift_index == 0 else seeds[:3]
@@ -1114,6 +1357,55 @@ class StackBoxes(Node):
         self._log_tool(f"{label} 偏差过大", x, y, z)
         return False
 
+    def _pick_by_lift(self, x, y, z):
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+        drop = pose.position.z - z
+        if horizontal > 0.03 or drop <= 0.02:
+            return False
+        target_lift = self._lift_now() - drop
+        if target_lift < -0.01:
+            return False
+        self.get_logger().info(f"取料只降升降 {drop:.3f} m，手臂保持在箱子上方")
+        if not self._follow_lift(max(0.0, target_lift), 0.04):
+            return False
+        pose = self._measured_tool()
+        if pose is not None:
+            fix = min(LIFT_LIMIT, max(0.0, self._lift_now() + (z - pose.position.z)))
+            if abs(fix - self._lift_now()) > 0.01 and not self._follow_lift(fix, 0.03):
+                return False
+        if self._at_tool(x, y, z, 0.03):
+            self._log_tool("取料", x, y, z)
+            return True
+        self.get_logger().warn("升降取料后还有偏差，手臂再对一次")
+        return bool(self._aim_arm(x, y, z, z) and self._at_tool(x, y, z, 0.03))
+
+    def _arm_path_stays_over(self, joints, x, y, floor_z):
+        """True when a straight joint move keeps the cup above the box."""
+        current = self._current_arm()
+        if current is None:
+            return False
+        lift = self._lift_now()
+        for index in range(1, 7):
+            fraction = index / 6.0
+            smooth = fraction * fraction * (3.0 - 2.0 * fraction)
+            mid = {
+                name: current[name] + (joints[name] - current[name]) * smooth
+                for name in ARM_LIMITS
+            }
+            state = RobotState()
+            state.joint_state = self._ik_seed(mid, lift)
+            pose = self._forward_tool(state)
+            if pose is None:
+                return False
+            if math.hypot(pose.position.x - x, pose.position.y - y) > 0.035:
+                return False
+            if pose.position.z < floor_z - 0.02:
+                return False
+        return True
+
     def _move_vertical(self, x, y, z, label):
         pose = self._measured_tool()
         cursor = pose.position.z
@@ -1124,6 +1416,11 @@ class StackBoxes(Node):
         self.pick_clearance = label == "取料" or previous_clearance
         self._publish_collision_matrix()
         try:
+            # The wrist is already over the box. Dropping the lift keeps that
+            # pose; re-solving the arm here is what runs out of a nearby elbow.
+            if label == "取料" and self._pick_by_lift(x, y, z):
+                return True
+            switched = False
             while True:
                 remaining = z - cursor
                 # Place creeps down. A 4 cm step finishes in the controller
@@ -1140,6 +1437,19 @@ class StackBoxes(Node):
                 if label == "放置":
                     tolerance = 0.012 if abs(target_z - z) <= 1e-4 else 0.018
                 reached = self._move_tool_direct(x, y, target_z, label, tolerance, False)
+                if not reached and label == "取料" and not switched:
+                    switched = True
+                    free = self._solve_arm(x, y, target_z, fixed_lift=self._lift_now())
+                    if (
+                        free is not None
+                        and self._arm_path_stays_over(free, x, y, target_z)
+                        and self._follow_arm(free, 0.2)
+                    ):
+                        self.get_logger().info("取料换了手臂姿态，吸盘仍在纸箱上方")
+                        self.arm_seed = {name: free[name] for name in ARM_LIMITS}
+                        reached = True
+                    else:
+                        self.get_logger().warn("换姿态会让吸盘离开纸箱，停止")
                 if label == "放置":
                     if not self._hold_xy(x, y, target_z):
                         return False
@@ -1157,6 +1467,11 @@ class StackBoxes(Node):
     def _move_tool_direct(
         self, x, y, z, label, tolerance=0.035, allow_pose_fallback=True, wait=2.0
     ):
+        # A short clearance move often has no nearby inverse solution even
+        # though the cup is already inside the tolerance. Forcing one swings.
+        if self._at_tool(x, y, z, tolerance):
+            self._log_tool(label, x, y, z)
+            return True
         measured = self._measured_tool()
         max_joint_delta = None
         if measured is not None:
