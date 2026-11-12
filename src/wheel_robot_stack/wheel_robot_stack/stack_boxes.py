@@ -23,10 +23,13 @@ from moveit_msgs.msg import (
     MoveItErrorCodes,
     OrientationConstraint,
     PlanningScene,
+    PlanningSceneComponents,
     PositionConstraint,
     RobotState,
 )
-from moveit_msgs.srv import ApplyPlanningScene, GetPositionFK, GetPositionIK, GetStateValidity
+from moveit_msgs.srv import (
+    ApplyPlanningScene, GetPlanningScene, GetPositionFK, GetPositionIK, GetStateValidity,
+)
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
@@ -108,7 +111,7 @@ class StackBoxes(Node):
         self.arm_seed = None
         self.safe_arm = None
         self.holding = False
-        self.retreat_clearance = False
+        self.place_path = []
         self.pick_clearance = False
         self.base_pose = None
         self.home_pose = None
@@ -123,6 +126,7 @@ class StackBoxes(Node):
         self.create_subscription(Odometry, "ground_truth_odom", self._on_odom, 10)
         self.move = ActionClient(self, MoveGroup, "move_action")
         self.scene = self.create_client(ApplyPlanningScene, "apply_planning_scene")
+        self.get_scene = self.create_client(GetPlanningScene, "get_planning_scene")
         self.ik = self.create_client(GetPositionIK, "compute_ik")
         self.fk = self.create_client(GetPositionFK, "compute_fk")
         self.validity = self.create_client(GetStateValidity, "check_state_validity")
@@ -433,34 +437,70 @@ class StackBoxes(Node):
         sx, sy = self._into_base(slot.x, slot.y)
         if not self._move_tool(sx, sy, place_z + APPROACH_HEIGHT, "放置上方"):
             return False
+        self.place_path = []
+        self._record_place_waypoint()
         if not self._move_tool(sx, sy, place_z, "放置"):
             return False
         self.set_suction(False)
         self.sleep(0.6)
         settled = (slot.x, slot.y, slot.support_z + BOX[2] / 2.0)
-        self._detach_at(slot.index, settled)
+        if not self._detach_at(slot.index, settled):
+            self.get_logger().error("释放后的规划场景没有确认成功，停止撤离。")
+            return False
         if not self._retreat(sx, sy, place_z + APPROACH_HEIGHT):
-            self.get_logger().error("撤离失败，手臂还停在托盘里，停止。")
+            self.get_logger().error("撤离未通过路径或实测位置校验，停止；具体位置见前面的日志。")
             return False
         self.get_logger().info(f"已放下格子 {slot.index}")
         return True
 
+    def _record_place_waypoint(self):
+        arm = self._current_arm()
+        pose = self._measured_tool()
+        if arm is None or pose is None:
+            return
+        position = (pose.position.x, pose.position.y, pose.position.z)
+        self.place_path.append((arm, self._lift_now(), position))
+
+
     def _retreat(self, x, y, z):
-        if self._move_tool(x, y, z, "撤离"):
+        # Reuse the measured descent branch instead of asking KDL to rediscover
+        # a nearby solution at the deeply folded placement pose. Each segment
+        # is still planned against the scene, including the newly placed box.
+        if len(self.place_path) >= 2:
+            self.get_logger().info("沿放置时记录的关节姿态逐段撤离")
+            for arm, lift, position in reversed(self.place_path[:-1]):
+                if abs(self._lift_now() - lift) > 0.03:
+                    self.get_logger().error("下降过程中升降发生变化，不能仅靠手臂反向撤离")
+                    return False
+                if not self._arm_at(arm, 0.02):
+                    if not self._move_named_joints(arm):
+                        return False
+                if not self._wait_tool(*position, timeout=4.0, tolerance=0.035):
+                    # Correct once toward the same recorded configuration. Do
+                    # not accept controller success without measured feedback.
+                    self._log_tool("撤离未到记录点，修正一次", *position)
+                    if not self._move_named_joints(arm):
+                        return False
+                    if not self._wait_tool(*position, timeout=4.0, tolerance=0.035):
+                        self._log_tool("撤离未到记录点", *position)
+                        return False
+                self.arm_seed = dict(arm)
+            pose = self._measured_tool()
+            if pose is None:
+                self.get_logger().error("撤离缺少末端反馈，不能确认净空")
+                return False
+            # The hover was accepted with a 3.5 cm tracking tolerance on the
+            # way in. Allow the same return error, but keep an independent
+            # minimum-height and lateral bound against the intended hover.
+            horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
+            if pose.position.z < z - 0.035 or horizontal > 0.06:
+                self._log_tool("撤离净空不足或横向偏移过大", x, y, z)
+                return False
+            self._log_tool("撤离完成", x, y, z)
             return True
-        self.get_logger().warn("垂直撤离被托盘挡住，允许手臂贴着托盘再抬一次")
-        self.retreat_clearance = True
-        self._publish_collision_matrix()
-        try:
-            if self._move_tool(x, y, z, "撤离"):
-                return True
-            if self.safe_arm and self._move_named_joints(self.safe_arm):
-                self.get_logger().info("手臂已回到搬运姿态")
-                return True
-        finally:
-            self.retreat_clearance = False
-            self._publish_collision_matrix()
-        return False
+        # Never bypass pallet collisions or swing straight to a distant carry
+        # posture when a local retreat fails.
+        return self._move_tool(x, y, z, "撤离")
 
     def _move_named_joints(self, joints):
         constraints = Constraints()
@@ -468,8 +508,8 @@ class StackBoxes(Node):
             joint = JointConstraint()
             joint.joint_name = name
             joint.position = float(value)
-            joint.tolerance_above = 0.05
-            joint.tolerance_below = 0.05
+            joint.tolerance_above = 0.01
+            joint.tolerance_below = 0.01
             joint.weight = 1.0
             constraints.joint_constraints.append(joint)
         return self._move("left_arm", constraints)
@@ -753,7 +793,7 @@ class StackBoxes(Node):
             seeds.append(current)
         for _ in range(6):
             seeds.append({name: random.uniform(low, high) for name, (low, high) in ARM_LIMITS.items()})
-        reference = self.arm_seed or current or {name: 0.0 for name in ARM_LIMITS}
+        reference = current or self.arm_seed or {name: 0.0 for name in ARM_LIMITS}
         preferred = lift_for_tool_z(z)
         # Stay at the current lift for the vertical approach and retreat.
         # Changing it between the pick and the lift-off is what produced the
@@ -763,6 +803,7 @@ class StackBoxes(Node):
         for value in self._candidate_lifts(z):
             if all(abs(value - other) > 0.03 for other in lifts):
                 lifts.append(value)
+        rejected = {"ik": 0, "collision": 0, "fk": 0, "joint_delta": 0}
         for lift_index, lift in enumerate(lifts):
             arm_seeds = seeds if lift_index == 0 else seeds[:3]
             best = None
@@ -781,6 +822,7 @@ class StackBoxes(Node):
                 rclpy.spin_until_future_complete(self, future)
                 result = future.result()
                 if result is None or result.error_code.val != MoveItErrorCodes.SUCCESS:
+                    rejected["ik"] += 1
                     continue
                 check = GetStateValidity.Request()
                 check.robot_state = result.solution
@@ -789,8 +831,10 @@ class StackBoxes(Node):
                 rclpy.spin_until_future_complete(self, checked)
                 validity = checked.result()
                 if validity is None or not validity.valid:
+                    rejected["collision"] += 1
                     continue
                 if not self._tool_reaches(result.solution, x, y, z):
+                    rejected["fk"] += 1
                     continue
                 positions = dict(zip(result.solution.joint_state.name, result.solution.joint_state.position))
                 if any(name not in positions for name in ARM_LIMITS):
@@ -806,6 +850,7 @@ class StackBoxes(Node):
                     if any(
                         abs(solution[name] - current[name]) > max_joint_delta for name in ARM_LIMITS
                     ):
+                        rejected["joint_delta"] += 1
                         continue
                 cost = sum(abs(solution[name] - reference[name]) for name in ARM_LIMITS)
                 cost += 3.0 * abs(solution["linear_Link"] - preferred)
@@ -814,6 +859,7 @@ class StackBoxes(Node):
                     best_cost = cost
             if best is not None:
                 return best
+        self.get_logger().warn(f"逆解候选全部失败 {rejected}，关节步长限制 {max_joint_delta}")
         return None
 
     def _tool_reaches(self, robot_state, x, y, z):
@@ -946,7 +992,8 @@ class StackBoxes(Node):
         direction = 1.0 if z > cursor else -1.0
         # The forearm meets the pickup box on the way down. Allow that contact
         # so inverse kinematics can keep the same elbow instead of swinging aside.
-        self.pick_clearance = True
+        previous_clearance = self.pick_clearance
+        self.pick_clearance = label == "取料" or previous_clearance
         self._publish_collision_matrix()
         try:
             while True:
@@ -961,11 +1008,13 @@ class StackBoxes(Node):
                 tolerance = 0.025 if direction < 0 and abs(target_z - z) <= 1e-4 else 0.035
                 if not self._move_tool_direct(x, y, target_z, label, tolerance, False):
                     return False
+                if label == "放置":
+                    self._record_place_waypoint()
                 cursor = target_z
                 if abs(cursor - z) <= 1e-4:
                     return True
         finally:
-            self.pick_clearance = False
+            self.pick_clearance = previous_clearance
             self._publish_collision_matrix()
 
     def _move_tool_direct(
@@ -987,7 +1036,6 @@ class StackBoxes(Node):
             solved = self._solve_arm(x, y, z, max_joint_delta * 2.0)
         if solved is not None:
             arm_only = {name: solved[name] for name in ARM_LIMITS}
-            self.arm_seed = arm_only
             if not self._move_torso(solved["linear_Link"]):
                 return False
             constraints = Constraints()
@@ -1009,6 +1057,7 @@ class StackBoxes(Node):
             # already on the target; otherwise the arm never left the last pose.
             if self._move("left_arm", constraints) or self._at_tool(x, y, z, tolerance):
                 if self._wait_tool(x, y, z, wait, tolerance):
+                    self.arm_seed = dict(arm_only)
                     self._log_tool(label, x, y, z)
                     return True
                 # Carrying: accept a few centimetres of lag if the box is clearly up.
@@ -1155,7 +1204,7 @@ class StackBoxes(Node):
         in self-collision.
         """
         links = EE_LINKS + GRIPPER_LINKS
-        if self.retreat_clearance or self.pick_clearance:
+        if self.pick_clearance:
             links = links + ["Link1_L", "Link2_L", "Link3_L", "Link4_L"]
         names = list(self._srdf_names)
         extra = ["carried"] if self.holding else []
@@ -1247,8 +1296,6 @@ class StackBoxes(Node):
         attached.link_name = "tool0_L"
         attached.object = remove
         placed_id = f"placed_{index}"
-        self.world_boxes.append((placed_id, center, BOX))
-        self.scene_ids.append(placed_id)
         local_x, local_y = self._into_base(center[0], center[1])
         placed = self._box(placed_id, (local_x, local_y, center[2]), BOX)
         scene = PlanningScene()
@@ -1257,9 +1304,44 @@ class StackBoxes(Node):
         scene.robot_state.attached_collision_objects = [attached]
         scene.robot_state.is_diff = True
         if not self._call_scene(scene):
-            return
+            return False
+        # Detaching with REMOVE transfers the attached shape back to the world
+        # under its old ID. Remove that duplicate in a SECOND scene update:
+        # world updates are processed before attached-object updates.
+        cleanup = PlanningScene()
+        cleanup.is_diff = True
+        cleanup.world.collision_objects = [remove]
+        if not self._call_scene(cleanup):
+            return False
+        if not self.get_scene.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("无法核验释放场景：get_planning_scene 不可用")
+            return False
+        request = GetPlanningScene.Request()
+        request.components.components = (
+            PlanningSceneComponents.WORLD_OBJECT_NAMES
+            | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+        )
+        future = self.get_scene.call_async(request)
+        rclpy.spin_until_future_complete(self, future)
+        result = future.result()
+        if result is None:
+            return False
+        world = {obj.id for obj in result.scene.world.collision_objects}
+        attached_ids = {
+            obj.object.id for obj in result.scene.robot_state.attached_collision_objects
+        }
+        if "carried" in world or "carried" in attached_ids or placed_id not in world:
+            self.get_logger().error(
+                f"释放场景异常：world={sorted(world)}，attached={sorted(attached_ids)}"
+            )
+            return False
         self.holding = False
-        self._publish_collision_matrix()
+        self.world_boxes.append((placed_id, center, BOX))
+        self.scene_ids.append(placed_id)
+        if not self._publish_collision_matrix():
+            return False
+        self.get_logger().info(f"释放场景已确认：{placed_id} 已落地，carried 已清除")
+        return True
 
 
 def main():
