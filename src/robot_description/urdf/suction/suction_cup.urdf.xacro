@@ -1,0 +1,53 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Standalone suction cup. Not included by the wheel robot.
+       The parent joint origin is the mount flange. +Z points out through the seal.
+       Neck: r=12 mm, length 40 mm. Lip: r=28 mm, length 8 mm. Seal face at z=51 mm. -->
+  <xacro:macro name="suction_cup" params="prefix parent *origin">
+
+    <joint name="${prefix}suction_cup_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${prefix}suction_cup"/>
+      <xacro:insert_block name="origin"/>
+    </joint>
+
+    <link name="${prefix}suction_cup">
+      <visual>
+        <origin xyz="0 0 0.02" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.012" length="0.04"/>
+        </geometry>
+        <material name="suction_metal">
+          <color rgba="0.75 0.75 0.78 1"/>
+        </material>
+      </visual>
+      <visual>
+        <origin xyz="0 0 0.044" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.028" length="0.008"/>
+        </geometry>
+        <material name="suction_lip">
+          <color rgba="0.9 0.4 0.1 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.02" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.012" length="0.04"/>
+        </geometry>
+      </collision>
+      <collision>
+        <origin xyz="0 0 0.044" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.028" length="0.008"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 0.025" rpy="0 0 0"/>
+        <mass value="0.08"/>
+        <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00003"/>
+      </inertial>
+    </link>
+
+  </xacro:macro>
+</robot>

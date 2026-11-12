@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  URDF:
+    package: wheel_robot_moveit_config
+    relative_path: config/wheel_robot.urdf.xacro
+  SRDF:
+    relative_path: config/wheel_robot.srdf
+  CONFIG:
+    author_name: user
+    author_email: user@todo.todo
+    generated_timestamp: 1761700000

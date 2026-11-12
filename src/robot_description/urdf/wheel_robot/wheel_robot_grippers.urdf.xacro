@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Fragment: dual Robotiq 2F-85 on Link7_L / Link7_R. Requires robotiq_85_gripper macro. -->
+
+  <link name="tool0_L"/>
+  <joint name="Link7_L_tool0_joint" type="fixed">
+    <!-- Straight out of the wrist, along the arm axis (+Y). -->
+    <origin xyz="0 0.095 0" rpy="${-pi/2} 0 0"/>
+    <parent link="Link7_L"/>
+    <child link="tool0_L"/>
+  </joint>
+
+  <link name="left_robotiq_coupler">
+    <visual>
+      <geometry>
+        <mesh filename="package://robot_description/meshes/coupler.stl"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://robot_description/meshes/coupler.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="2.073e-05 1.45286e-03 -1.1049e-03" rpy="0 0 0"/>
+      <mass value="0.168"/>
+      <inertia ixx="6.69695624e-05" ixy="5.21511788e-09" ixz="-2.74383009e-08"
+               iyy="7.85088161e-05" iyz="5.41105193e-07" izz="1.41819717e-04"/>
+    </inertial>
+  </link>
+  <joint name="left_robotiq_coupler_joint" type="fixed">
+    <origin xyz="0 0 0.004" rpy="0 0 ${pi/2}"/>
+    <parent link="tool0_L"/>
+    <child link="left_robotiq_coupler"/>
+  </joint>
+  <xacro:robotiq_85_gripper prefix="left_" parent="left_robotiq_coupler">
+    <origin xyz="0 0 0.004" rpy="0 ${-pi/2} ${pi}"/>
+  </xacro:robotiq_85_gripper>
+
+  <link name="tool0_R"/>
+  <joint name="Link7_R_tool0_joint" type="fixed">
+    <!-- Straight out of the wrist, along the arm axis (-Y). -->
+    <origin xyz="0 -0.095 0" rpy="${pi/2} 0 0"/>
+    <parent link="Link7_R"/>
+    <child link="tool0_R"/>
+  </joint>
+
+  <link name="right_robotiq_coupler">
+    <visual>
+      <geometry>
+        <mesh filename="package://robot_description/meshes/coupler.stl"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://robot_description/meshes/coupler.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="2.073e-05 1.45286e-03 -1.1049e-03" rpy="0 0 0"/>
+      <mass value="0.168"/>
+      <inertia ixx="6.69695624e-05" ixy="5.21511788e-09" ixz="-2.74383009e-08"
+               iyy="7.85088161e-05" iyz="5.41105193e-07" izz="1.41819717e-04"/>
+    </inertial>
+  </link>
+  <joint name="right_robotiq_coupler_joint" type="fixed">
+    <origin xyz="0 0 0.004" rpy="0 0 ${pi/2}"/>
+    <parent link="tool0_R"/>
+    <child link="right_robotiq_coupler"/>
+  </joint>
+  <xacro:robotiq_85_gripper prefix="right_" parent="right_robotiq_coupler">
+    <origin xyz="0 0 0.004" rpy="0 ${-pi/2} ${pi}"/>
+  </xacro:robotiq_85_gripper>
+</robot>

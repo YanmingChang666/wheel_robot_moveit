@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="wheel_robot">
+  <!-- Root is base_link. lidar_localization publishes odom -> base_link.
+       The combined MoveIt launch uses wheel_robot_mobile.urdf.xacro, which
+       has the same root plus ros2_control. -->
+  <xacro:include filename="$(find robot_description)/urdf/robotiq/robotiq_85_gripper.urdf.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/wheel_robot/wheel_robot_body.urdf.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/wheel_robot/wheel_robot_grippers.urdf.xacro"/>
+
+  <!-- 16-beam lidar, just above the upper-body mesh so the arms stay below it. -->
+  <link name="lidar_link"/>
+  <joint name="lidar_joint" type="fixed">
+    <origin xyz="0 0 0.66" rpy="0 0 0"/>
+    <parent link="waist_yaw_Link"/>
+    <child link="lidar_link"/>
+  </joint>
+
+  <!-- Chassis IMU, aligned with base_link. Matches the Isaac sensor mount. -->
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0 0 0.20" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+</robot>

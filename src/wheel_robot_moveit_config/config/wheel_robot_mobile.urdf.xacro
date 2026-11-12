@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="wheel_robot">
+  <xacro:arg name="initial_positions_file" default="initial_positions.yaml"/>
+
+  <!-- base_link is the root. lidar_localization publishes odom -> base_link,
+       and the combined launch adds a planar virtual joint so MoveIt plans in
+       odom. A fixed world joint here would give base_link a second parent. -->
+  <xacro:include filename="$(find robot_description)/urdf/robotiq/robotiq_85_gripper.urdf.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/wheel_robot/wheel_robot_body.urdf.xacro"/>
+  <xacro:include filename="$(find robot_description)/urdf/wheel_robot/wheel_robot_grippers.urdf.xacro"/>
+
+  <link name="lidar_link"/>
+  <joint name="lidar_joint" type="fixed">
+    <origin xyz="0 0 0.66" rpy="0 0 0"/>
+    <parent link="waist_yaw_Link"/>
+    <child link="lidar_link"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <origin xyz="0 0 0.20" rpy="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+
+  <xacro:include filename="wheel_robot.ros2_control.xacro"/>
+  <xacro:wheel_robot_ros2_control
+    name="IsaacTopicSystem"
+    initial_positions_file="$(arg initial_positions_file)"/>
+</robot>

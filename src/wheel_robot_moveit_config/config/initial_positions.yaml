@@ -1,0 +1,20 @@
+initial_positions:
+  linear_Link: 0.0
+  waist_pitch_Link: 0.0
+  waist_yaw_Link: 0.0
+  Link1_L_joint: 0.0
+  Link2_L_joint: 0.0
+  Link3_L_joint: 0.0
+  Link4_L_joint: 0.0
+  Link5_L_joint: 0.0
+  Link6_L_joint: 0.0
+  Link7_L_joint: 0.0
+  Link1_R_joint: 0.0
+  Link2_R_joint: 0.0
+  Link3_R_joint: 0.0
+  Link4_R_joint: 0.0
+  Link5_R_joint: 0.0
+  Link6_R_joint: 0.0
+  Link7_R_joint: 0.0
+  left_robotiq_85_left_knuckle_joint: 0.0
+  right_robotiq_85_left_knuckle_joint: 0.0

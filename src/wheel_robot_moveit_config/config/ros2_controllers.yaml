@@ -1,0 +1,96 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+
+    left_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    right_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    torso_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    left_gripper_controller:
+      type: position_controllers/GripperActionController
+    right_gripper_controller:
+      type: position_controllers/GripperActionController
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+left_arm_controller:
+  ros__parameters:
+    joints:
+      - Link1_L_joint
+      - Link2_L_joint
+      - Link3_L_joint
+      - Link4_L_joint
+      - Link5_L_joint
+      - Link6_L_joint
+      - Link7_L_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    # 0.08 rad and 1.5 s abort the descent while Isaac is still catching up,
+    # which stops the cup beside the box (MoveIt -4). The stack node also
+    # checks the measured tool pose, so this window only has to let the motion finish.
+    constraints:
+      stopped_velocity_tolerance: 0.5
+      goal_time: 6.0
+      Link1_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link2_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link3_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link4_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link5_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link6_L_joint: {trajectory: 0.0, goal: 0.15}
+      Link7_L_joint: {trajectory: 0.0, goal: 0.15}
+
+right_arm_controller:
+  ros__parameters:
+    joints:
+      - Link1_R_joint
+      - Link2_R_joint
+      - Link3_R_joint
+      - Link4_R_joint
+      - Link5_R_joint
+      - Link6_R_joint
+      - Link7_R_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    constraints:
+      stopped_velocity_tolerance: 0.5
+      goal_time: 6.0
+      Link1_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link2_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link3_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link4_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link5_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link6_R_joint: {trajectory: 0.0, goal: 0.15}
+      Link7_R_joint: {trajectory: 0.0, goal: 0.15}
+
+torso_controller:
+  ros__parameters:
+    joints:
+      - linear_Link
+      - waist_pitch_Link
+      - waist_yaw_Link
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    constraints:
+      stopped_velocity_tolerance: 0.5
+      goal_time: 6.0
+      linear_Link: {trajectory: 0.0, goal: 0.03}
+      waist_pitch_Link: {trajectory: 0.0, goal: 0.15}
+      waist_yaw_Link: {trajectory: 0.0, goal: 0.15}
+
+left_gripper_controller:
+  ros__parameters:
+    joint: left_robotiq_85_left_knuckle_joint
+    # Isaac often reports ~0 velocity, so the default 1s stall check aborts a close.
+    # Stalling is a successful grasp (fingers stopped on the target or the goal).
+    allow_stalling: true
+    stall_timeout: 2.0
+    goal_tolerance: 0.05
+
+right_gripper_controller:
+  ros__parameters:
+    joint: right_robotiq_85_left_knuckle_joint
+    allow_stalling: true
+    stall_timeout: 2.0
+    goal_tolerance: 0.05

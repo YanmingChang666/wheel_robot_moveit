@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="wheel_robot_ros2_control" params="name initial_positions_file">
+    <xacro:property name="initial_positions" value="${load_yaml(initial_positions_file)['initial_positions']}"/>
+
+    <ros2_control name="${name}" type="system">
+      <hardware>
+        <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
+        <param name="joint_commands_topic">/isaac_joint_commands</param>
+        <param name="joint_states_topic">/isaac_joint_states</param>
+      </hardware>
+
+      <!-- Torso -->
+      <xacro:macro name="pos_joint" params="joint_name">
+        <joint name="${joint_name}">
+          <command_interface name="position"/>
+          <state_interface name="position">
+            <param name="initial_value">${initial_positions[joint_name]}</param>
+          </state_interface>
+          <state_interface name="velocity"/>
+        </joint>
+      </xacro:macro>
+
+      <xacro:pos_joint joint_name="linear_Link"/>
+      <xacro:pos_joint joint_name="waist_pitch_Link"/>
+      <xacro:pos_joint joint_name="waist_yaw_Link"/>
+
+      <!-- Left arm -->
+      <xacro:pos_joint joint_name="Link1_L_joint"/>
+      <xacro:pos_joint joint_name="Link2_L_joint"/>
+      <xacro:pos_joint joint_name="Link3_L_joint"/>
+      <xacro:pos_joint joint_name="Link4_L_joint"/>
+      <xacro:pos_joint joint_name="Link5_L_joint"/>
+      <xacro:pos_joint joint_name="Link6_L_joint"/>
+      <xacro:pos_joint joint_name="Link7_L_joint"/>
+
+      <!-- Right arm -->
+      <xacro:pos_joint joint_name="Link1_R_joint"/>
+      <xacro:pos_joint joint_name="Link2_R_joint"/>
+      <xacro:pos_joint joint_name="Link3_R_joint"/>
+      <xacro:pos_joint joint_name="Link4_R_joint"/>
+      <xacro:pos_joint joint_name="Link5_R_joint"/>
+      <xacro:pos_joint joint_name="Link6_R_joint"/>
+      <xacro:pos_joint joint_name="Link7_R_joint"/>
+
+      <!-- Grippers (actuated knuckle only; mimics follow in Isaac) -->
+      <xacro:pos_joint joint_name="left_robotiq_85_left_knuckle_joint"/>
+      <xacro:pos_joint joint_name="right_robotiq_85_left_knuckle_joint"/>
+    </ros2_control>
+  </xacro:macro>
+</robot>

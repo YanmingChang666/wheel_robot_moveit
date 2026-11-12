@@ -1,0 +1,43 @@
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
+joint_limits:
+  linear_Link:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: false
+    max_acceleration: 0
+  waist_pitch_Link:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  waist_yaw_Link:
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: false
+    max_acceleration: 0
+  Link1_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link2_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link3_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link4_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link5_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link6_L_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link7_L_joint: {has_velocity_limits: true, max_velocity: 3.46, has_acceleration_limits: false, max_acceleration: 0}
+  Link1_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link2_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link3_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link4_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link5_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link6_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  Link7_R_joint: {has_velocity_limits: true, max_velocity: 3.1416, has_acceleration_limits: false, max_acceleration: 0}
+  left_robotiq_85_left_knuckle_joint:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: false
+    max_acceleration: 0
+  right_robotiq_85_left_knuckle_joint:
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: false
+    max_acceleration: 0

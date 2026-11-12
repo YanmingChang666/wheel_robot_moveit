@@ -1,0 +1,72 @@
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+# Default 0.01 rad rejects a trajectory whose first point is a single
+# joint-state sample away from the monitored state. Isaac's /joint_states
+# jitter past that, and MoveIt then returns CONTROL_FAILED (-4) before the arm moves.
+trajectory_execution:
+  allowed_start_tolerance: 0.05
+  # Isaac finishes a short descent slower than the planned clock.
+  # 1.2x + 0.5 s cancels the cup in mid-air (MoveIt -6).
+  allowed_execution_duration_scaling: 4.0
+  allowed_goal_duration_margin: 3.0
+
+moveit_simple_controller_manager:
+  controller_names:
+    - left_arm_controller
+    - right_arm_controller
+    - torso_controller
+    - left_gripper_controller
+    - right_gripper_controller
+
+  left_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - Link1_L_joint
+      - Link2_L_joint
+      - Link3_L_joint
+      - Link4_L_joint
+      - Link5_L_joint
+      - Link6_L_joint
+      - Link7_L_joint
+
+  right_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - Link1_R_joint
+      - Link2_R_joint
+      - Link3_R_joint
+      - Link4_R_joint
+      - Link5_R_joint
+      - Link6_R_joint
+      - Link7_R_joint
+
+  torso_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - linear_Link
+      - waist_pitch_Link
+      - waist_yaw_Link
+
+  left_gripper_controller:
+    type: GripperCommand
+    joints:
+      - left_robotiq_85_left_knuckle_joint
+    action_ns: gripper_cmd
+    default: true
+    allow_failure: true
+    max_effort: 100.0
+
+  right_gripper_controller:
+    type: GripperCommand
+    joints:
+      - right_robotiq_85_left_knuckle_joint
+    action_ns: gripper_cmd
+    default: true
+    allow_failure: true
+    max_effort: 100.0
