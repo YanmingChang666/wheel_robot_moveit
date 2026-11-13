@@ -83,14 +83,25 @@ def _publish_poses():
         prim = stage.GetPrimAtPath(f"/World/stack/box_{{index}}")
         if not prim.IsValid():
             break
-        translation = omni.usd.get_world_transform_matrix(prim).ExtractTranslation()
-        rotation = omni.usd.get_world_transform_matrix(prim).ExtractRotationQuat()
+        transform = Gf.Transform(omni.usd.get_world_transform_matrix(prim))
+        translation = transform.GetTranslation()
+        rotation = transform.GetRotation().GetQuat()
         imaginary = rotation.GetImaginary()
         parts.append(
             f"{{index}}:{{translation[0]:.4f}},{{translation[1]:.4f}},{{translation[2]:.4f}},"
             f"{{imaginary[0]:.5f}},{{imaginary[1]:.5f}},{{imaginary[2]:.5f}},{{rotation.GetReal():.5f}}"
         )
         index += 1
+    # Negative IDs are actual world-frame gripper query poses, not boxes.
+    for key, side in ((-1, "L"), (-2, "R")):
+        prim = stage.GetPrimAtPath(f"/wheel_robot/tool0_{{side}}/suction_cup/grip_point")
+        if not prim.IsValid():
+            continue
+        transform = Gf.Transform(omni.usd.get_world_transform_matrix(prim))
+        t = transform.GetTranslation()
+        q = transform.GetRotation().GetQuat()
+        v = q.GetImaginary()
+        parts.append(f"{{key}}:{{t[0]:.5f}},{{t[1]:.5f}},{{t[2]:.5f}},{{v[0]:.6f}},{{v[1]:.6f}},{{v[2]:.6f}},{{q.GetReal():.6f}}")
     try:
         data.set(";".join(parts))
     except Exception:

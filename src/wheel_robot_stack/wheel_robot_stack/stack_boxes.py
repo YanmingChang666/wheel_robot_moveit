@@ -45,9 +45,14 @@ from wheel_robot_nav.kinematics import MODULES, steer_error, twist_to_wheels
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Bool, Int32, String
 
+from wheel_robot_stack.handling import (
+    overlaps_station, pickup_pose_ok, pose_angles, relative_pose, downward_quaternion, orientation_distance, rotation_matrix,
+)
+
 from wheel_robot_stack.pattern import (
     APPROACH_HEIGHT,
     BOX,
+    GRIP_POINT,
     LIFT_LIMIT,
     STAND_SIZE,
     Slot,
@@ -62,9 +67,11 @@ from wheel_robot_stack.pattern import (
     unreachable_slots,
     pickup_center,
     route_around,
+    route_distance,
+    NoBasePose,
     stand_center,
     tool_z_for_pick,
-    tool_z_for_place,
+    under_slot,
 )
 
 # MoveIt still carries the Robotiq meshes. In the suction stage those prims are
@@ -120,6 +127,9 @@ class _Arm:
         self.seed = None
         self.holding = False
         self.grip = None
+        self.grip_time = None
+        self.box_drop = carried_offset()
+        self.box_index = None
         self.publisher = None
         self.trajectory = None
 
@@ -136,10 +146,13 @@ class StackBoxes(Node):
         self.joint_state = None
         self.wheel_state = None
         self.box_poses = {}
+        self.box_pose_serial = 0
+        self.box_pose_time = None
         self.place_path = []
         self.pick_clearance = False
         self.place_supports = set()
         self.base_pose = None
+        self.base_height = 0.0
         self.home_pose = None
         self.steer_hold = [0.0, 0.0, 0.0, 0.0]
         self.side = "left"
@@ -197,6 +210,7 @@ class StackBoxes(Node):
         quat = msg.pose.pose.orientation
         yaw = math.atan2(2.0 * quat.w * quat.z, 1.0 - 2.0 * quat.z * quat.z)
         self.base_pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+        self.base_height = float(msg.pose.pose.position.z)
         self._publish_ground_truth_tf()
 
     def _publish_ground_truth_tf(self):
@@ -344,6 +358,7 @@ class StackBoxes(Node):
 
     def _on_grip(self, name, msg):
         self._arms[name].grip = bool(msg.data)
+        self._arms[name].grip_time = self.get_clock().now()
 
     def _on_box_poses(self, msg):
         poses = {}
@@ -360,6 +375,8 @@ class StackBoxes(Node):
                 continue
         if poses:
             self.box_poses = poses
+            self.box_pose_serial += 1
+            self.box_pose_time = self.get_clock().now()
 
     def _apply_measured_boxes(self):
         """Replace planned centers with the prim centers Isaac is simulating."""
@@ -383,19 +400,27 @@ class StackBoxes(Node):
         self.world_boxes = updated
 
     def _measured_support(self, slot):
-        """Placed box directly under this slot, from the simulated prim pose."""
-        best = None
-        best_distance = 0.16
+        """Height of what a slot rests on, from the simulated prim poses.
+
+        Layers alternate between two positions, so the boxes below a slot are
+        not centered under it and one box can rest on up to four. The slot keeps
+        its planned x and y; only z comes from the highest placed box that
+        overlaps the slot's footprint. Snapping x and y to a single box below
+        would undo the interlock and rebuild straight columns.
+        """
+        top = None
         for name, center, _size in self.world_boxes:
             if not name.startswith("placed_"):
                 continue
             if center[2] > slot.z - 0.03:
                 continue
-            distance = math.hypot(center[0] - slot.x, center[1] - slot.y)
-            if distance < best_distance:
-                best = center
-                best_distance = distance
-        return best
+            if not under_slot(slot, center):
+                continue
+            if top is None or center[2] > top:
+                top = center[2]
+        if top is None:
+            return None
+        return (slot.x, slot.y, top)
 
     def set_suction(self, closed):
         message = Bool()
@@ -434,28 +459,89 @@ class StackBoxes(Node):
         self.sleep(0.3)
         self.set_suction(True)
 
+    def _align_suction_contact(self):
+        """Position the real grip query above the real box, without pressing it.
+
+        Read the actual Isaac query transform, including articulation and
+        wheel settling, rather than estimating it from URDF FK.
+        """
+        commanded_lift = self._lift_now()
+        commanded_tool_z = None
+        for _ in range(10):
+            tool=self._measured_tool()
+            box=self.box_poses.get(self.pick_prim)
+            if tool is None or box is None or not self._poses_fresh():
+                return False
+            point = self.box_poses.get(-1 if self.side == "left" else -2)
+            if point is None:
+                self.get_logger().error("缺少 Isaac 吸附检测点实测反馈，请重新打开更新的 riser 场景")
+                return False
+            down=rotation_matrix(point)[2][0]
+            point_z=point[2]
+            if down > -.95:
+                self.get_logger().error("吸盘未朝下，停止建立吸附")
+                return False
+            if not pickup_pose_ok(box,pickup_center(),BOX):
+                self.get_logger().error("接近过程中箱子偏离或歪斜，停止吸附")
+                return False
+            if (abs(point[0]-box[0]) > BOX[0]/2-.03
+                    or abs(point[1]-box[1]) > BOX[1]/2-.03):
+                self.get_logger().error("吸附检测点不在箱顶内部，停止吸附")
+                return False
+            gap=point_z-(box[2]+BOX[2]/2)
+            self.get_logger().info(f"实际吸附检测点距箱顶 {gap*1000:.1f} mm")
+            if .002 <= gap <= .012:
+                return True
+            correction=.006-gap
+            if abs(correction) > .08:
+                self.get_logger().error("吸附接触误差过大，不做大幅修正")
+                return False
+            step=max(-.025,min(.025,correction))
+            commanded_lift += step
+            if 0.0 <= commanded_lift <= LIFT_LIMIT:
+                if not self._follow_lift(commanded_lift,.06):
+                    return False
+            else:
+                # At the lift limit use short, collision-checked arm moves.
+                # Accumulate the command so steady actuator bias does not
+                # cancel the same small correction on every iteration.
+                commanded_lift=self._lift_now()
+                if commanded_tool_z is None:
+                    commanded_tool_z=tool.position.z
+                commanded_tool_z += step
+                solved=self._solve_arm(tool.position.x,tool.position.y,commanded_tool_z,
+                                       .45,fixed_lift=self._lift_now())
+                if solved is not None:
+                    if not self._follow_arm(solved,.2):
+                        return False
+                else:
+                    # Before closing, an alternative elbow is permissible,
+                    # but it must go through MoveIt's full path validation.
+                    solved=self._solve_arm(tool.position.x,tool.position.y,commanded_tool_z,
+                                           fixed_lift=self._lift_now())
+                    if solved is None or not self._move_named_joints(
+                        {name:solved[name] for name in self._arm().limits}
+                    ):
+                        return False
+        self.get_logger().error("吸附检测点未进入箱顶上方 2–12 mm，停止吸取")
+        return False
+
     def _grasp(self, x, y, z):
-        """Close on the box. A miss is another approach, never an empty carry."""
+        """Close only after measured clearance is set; verify a stable seal."""
+        del x,y,z
         for attempt in range(3):
-            if attempt:
-                self.get_logger().warn(f"吸盘没有吸住纸箱，第 {attempt + 1} 次再吸取")
-                self.set_suction(False)
-                if not self._move_tool(x, y, z + 0.04, "再吸取上方"):
-                    return False
-                if not self._move_tool(x, y, z, "再吸取"):
-                    return False
+            self.set_suction(False)
+            if not self._align_suction_contact():
+                return False
             self._pulse_suction()
-            held = self._wait_holding()
+            held=self._wait_holding(timeout=2.5,stable=1.0)
             if held is True:
-                self.get_logger().info("吸盘已吸住纸箱")
+                self.get_logger().info("吸盘已稳定吸住纸箱")
                 return True
             if held is None:
-                self.get_logger().error(
-                    "没有收到吸盘是否吸住的状态。请重新打开 wheel_robot_suction_stack_riser.usda 后再放。"
-                )
-                self.set_suction(False)
+                self.get_logger().error("没有吸附反馈，停止取料")
                 return False
-        self.get_logger().error("三次都没有吸住，这一格不放置，避免空放后下一箱叠空。")
+            self.get_logger().warn(f"吸附未保持，重新核对接触间隙，第 {attempt+1} 次")
         self.set_suction(False)
         return False
 
@@ -532,7 +618,12 @@ class StackBoxes(Node):
             f"托盘中心 ({pallet[0]:.3f}, {pallet[1]:.3f}, {pallet[2]:.3f})，"
             f"取料箱心 ({pickup[0]:.3f}, {pickup[1]:.3f}, {pickup[2]:.3f})"
         )
-        pairs = carry_pairs(slots, reach)
+        self.pickup_base = pick_plan("left").base
+        try:
+            pairs = carry_pairs(slots, reach, self.pickup_base)
+        except NoBasePose as error:
+            self.get_logger().error(str(error))
+            return
         picked = 0
         for batch in pairs:
             description = "，".join(
@@ -541,7 +632,16 @@ class StackBoxes(Node):
                 for slot, plan in batch
             )
             self.get_logger().info(f"同一趟先取后放：{description}")
-            for offset, (slot, plan) in enumerate(batch):
+            trip = [self.pickup_base, *(plan.base for _,plan in batch), self.pickup_base]
+            distance = sum(route_distance(a,b) for a,b in zip(trip,trip[1:]))
+            self.get_logger().info(f"本趟含返程规划距离 {distance:.2f} m；取两箱期间底盘保持不动")
+            if not self._drive_base(*self.pickup_base):
+                return
+            self.pickup_anchor = self.base_pose
+            # Both cups use the same base and waist pose. Pick left first to
+            # keep the order consistent while the placement order stays routed.
+            pick_order = sorted(batch, key=lambda item:item[1].arm != "left")
+            for offset, (slot, plan) in enumerate(pick_order):
                 if not self._pick_from_stand(plan.arm):
                     self.get_logger().error(
                         f"第 {slot.index} 格取料失败，停止。取料点不再生成新箱子。"
@@ -557,11 +657,94 @@ class StackBoxes(Node):
                         f"第 {slot.index} 格失败，停止。取料点不再生成新箱子。"
                     )
                     return
+            # Replenish only after both hands have finished and returned.
+            if not self._drive_base(*self.pickup_base):
+                return
             if picked < len(slots) and not self._spawn_box(picked):
                 return
         self.get_logger().info("可达格子已经堆完。")
 
+    def _poses_fresh(self):
+        return (self.box_pose_time is not None
+                and (self.get_clock().now()-self.box_pose_time).nanoseconds < 1e9)
+
+    def _wait_station_clear(self, timeout=5.0):
+        deadline = self.get_clock().now()+Duration(seconds=timeout)
+        reason = "缺少实测箱子位姿"
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            self.sleep(.1)
+            if not self._poses_fresh():
+                continue
+            blockers = []
+            for index, pose in self.box_poses.items():
+                if index < 0:
+                    continue
+                try:
+                    if overlaps_station(pose, pickup_center(), BOX):
+                        blockers.append(index)
+                except ValueError:
+                    blockers.append(index)
+            if not blockers:
+                return True
+            reason = f"box_{blockers} 仍占据新箱子的生成空间"
+        self.get_logger().error(f"取料区未清空，不补料：{reason}")
+        return False
+
+    def _wait_pickup_ready(self, index, timeout=5.0):
+        deadline = self.get_clock().now()+Duration(seconds=timeout)
+        stable_since = None
+        anchor = None
+        serial = self.box_pose_serial
+        reason = "缺少该箱子的实测位姿"
+        while rclpy.ok() and self.get_clock().now() < deadline:
+            self.sleep(.05)
+            if serial == self.box_pose_serial or not self._poses_fresh():
+                continue
+            serial = self.box_pose_serial
+            pose = self.box_poses.get(index)
+            if pose is None:
+                continue
+            try:
+                tilt,yaw = pose_angles(pose)
+                valid = pickup_pose_ok(pose,pickup_center(),BOX)
+            except ValueError as error:
+                reason = str(error)
+                stable_since = anchor = None
+                continue
+            reason = (f"box_{index} 倾斜 {math.degrees(tilt):.1f}°，"
+                      f"偏航 {math.degrees(yaw):.1f}°，箱心 {pose[:3]}")
+            if not valid:
+                stable_since = anchor = None
+                continue
+            if anchor is None or math.dist(pose[:3],anchor[:3]) > .003 or orientation_distance(pose,anchor) > math.radians(1):
+                anchor = pose
+                stable_since = self.get_clock().now()
+            elif self.get_clock().now()-stable_since >= Duration(seconds=.5):
+                self.get_logger().info(f"box_{index} 已在取料点放稳，倾斜 {math.degrees(tilt):.1f}°")
+                return True
+        self.get_logger().error(f"新箱子未放稳或已歪斜，不吸取：{reason}")
+        return False
+
+    def _held_box_aligned(self):
+        index = self._arm().box_index
+        pose = self.box_poses.get(index)
+        if not self._poses_fresh() or pose is None:
+            self.get_logger().error(f"box_{index} 缺少新鲜位姿反馈，不释放")
+            return False
+        try:
+            tilt,yaw = pose_angles(pose)
+        except ValueError:
+            return False
+        if tilt > math.radians(5) or yaw > math.radians(5):
+            self.get_logger().error(
+                f"box_{index} 倾斜 {math.degrees(tilt):.1f}°，偏航 {math.degrees(yaw):.1f}°，不释放歪箱"
+            )
+            return False
+        return True
+
     def _spawn_box(self, index):
+        if not self._wait_station_clear():
+            return False
         message = Int32()
         message.data = int(index)
         self.spawn.publish(message)
@@ -571,25 +754,22 @@ class StackBoxes(Node):
         self.world_boxes.append(("pickup", pickup_center(), BOX))
         if not self._sync_scene():
             return False
-        self.sleep(0.4)
-        return True
+        return self._wait_pickup_ready(index)
 
     def _pick_from_stand(self, arm_name):
         plan = pick_plan(arm_name)
         self._use(arm_name)
         self.waist_yaw = float(plan.waist)
-        base = plan.base
-        if (
-            arm_name == "left"
-            and self.home_pose is not None
-            and math.hypot(self.home_pose[0] - base[0], self.home_pose[1] - base[1]) < 0.25
-        ):
-            base = self.home_pose
+        base = getattr(self, "pickup_anchor", self.pickup_base)
+        if (self.base_pose is None or math.dist(self.base_pose[:2],base[:2]) > .025
+                or abs(math.atan2(math.sin(self.base_pose[2]-base[2]),
+                                  math.cos(self.base_pose[2]-base[2]))) > .04):
+            self.get_logger().error(f"取料底盘偏离停车实测位：当前 {self.base_pose}，停车 {base}；停止，不在两次取料之间开车")
+            return False
         self.get_logger().info(
-            f"{'左手' if arm_name == 'left' else '右手'}去取料，"
-            f"底盘 ({base[0]:.3f}, {base[1]:.3f}) 腰 {self.waist_yaw:.2f}"
+            f"{'左手' if arm_name == 'left' else '右手'}原地取料，底盘不动，腰角 0"
         )
-        if not self._drive_base(*base):
+        if not self._wait_pickup_ready(self.ready_index):
             return False
         self._sync_scene()
         px, py = self._into_base(*pickup_center()[:2])
@@ -598,30 +778,17 @@ class StackBoxes(Node):
         self._apply_measured_boxes()
         self.pick_prim = None
         self.pick_rest_z = None
-        for _name, center, _size in self.world_boxes:
-            if _name != "pickup":
-                continue
-            # The box still on the stand is whichever prim is nearest the station.
-            nearest = None
-            nearest_index = None
-            nearest_distance = 0.14
-            station = pickup_center()
-            for index, pose in self.box_poses.items():
-                distance = math.hypot(pose[0] - station[0], pose[1] - station[1])
-                if distance < nearest_distance and abs(pose[2] - station[2]) < 0.08:
-                    nearest = pose
-                    nearest_index = index
-                    nearest_distance = distance
-            if nearest is not None:
-                px, py = self._into_base(nearest[0], nearest[1])
-                pick_z = nearest[2] + carried_offset()
-                box_top = nearest[2] + BOX[2] / 2.0
-                self.pick_prim = nearest_index
-                self.pick_rest_z = nearest[2]
-                self.get_logger().info(
-                    f"取料对准实测箱心 ({nearest[0]:.3f}, {nearest[1]:.3f}, {nearest[2]:.3f})"
-                )
-            break
+        measured = self.box_poses[self.ready_index]
+        px, py = self._into_base(measured[0], measured[1])
+        pick_z = measured[2] + carried_offset()
+        box_top = measured[2] + BOX[2]/2
+        self.pick_prim = self.ready_index
+        self.pick_rest_z = measured[2]
+        self._arm().box_index = self.ready_index
+        self.get_logger().info(
+            f"取料 box_{self.pick_prim} 对准实测箱心 "
+            f"({measured[0]:.3f}, {measured[1]:.3f}, {measured[2]:.3f})"
+        )
         self.get_logger().info(
             f"箱顶 {box_top:.3f}，密封面贴住后工具高度 {pick_z:.3f}"
         )
@@ -635,34 +802,35 @@ class StackBoxes(Node):
         if goal is not None:
             self._arm().seed = {name: goal[name] for name in self._arm().limits}
             self.get_logger().info("取料先选定能贴住纸箱的手臂姿态")
-        # The other hand may already be carrying a box, so the first descent
-        # sometimes stops a couple of centimetres high. One more approach from
-        # the hover fixes that without abandoning the pair.
+        # Approach without forcing the virtual grip point into the box. The
+        # final contact is controlled by measured clearance, not a 4 mm joint
+        # planning gate around the old pressed pose.
         sealed = False
-        for attempt in range(2):
-            hover = pick_z + APPROACH_HEIGHT
-            target_z = pick_z
-            if attempt:
-                # The cup is already on the box. Another arm plan from this
-                # stretched pose has no nearby solution and used to abort a
-                # real grip. Press a little harder on the same vertical line.
-                self.get_logger().warn("纸箱没离架，再压低 6 mm")
+        self.pick_clearance = True
+        self._publish_collision_matrix()
+        try:
+            for attempt in range(2):
                 self.set_suction(False)
-                target_z = pick_z - 0.006
-            elif not self._move_tool(px, py, hover, "取料上方"):
-                continue
-            if not self._move_tool(px, py, target_z, "取料"):
-                continue
-            if not self._grasp(px, py, target_z):
-                continue
-            if self._box_left_stand(px, py, target_z):
-                sealed = True
-                break
-            self.get_logger().warn("吸盘报了吸住，纸箱却没离架，松开再压一次")
-            self.set_suction(False)
+                if not self._move_tool_direct(px,py,pick_z+APPROACH_HEIGHT,"取料上方",.03,False):
+                    continue
+                contact_z=box_top+GRIP_POINT+.006-self.base_height
+                if not self._pick_by_lift(px,py,contact_z):
+                    if not self._move_tool_direct(px,py,contact_z,"吸附接近",.03,False):
+                        continue
+                if not self._grasp(px,py,contact_z):
+                    continue
+                if self._box_left_stand(px,py,contact_z):
+                    sealed=True
+                    break
+                self.get_logger().warn("纸箱未离架，松开后重新核对实际间隙")
+                self.set_suction(False)
+        finally:
+            self.pick_clearance = False
+            self._publish_collision_matrix()
         if not sealed:
             return False
-        self._attach_carried()
+        if not self._attach_carried():
+            return False
         # Leave the stand vertically first. Diagonal carry-out while the box is
         # still on the bench shears the suction seal; Isaac also tracks 2-3 cm
         # behind the command, so a tight FK gate aborts a valid carry.
@@ -702,15 +870,15 @@ class StackBoxes(Node):
             return True
         self.get_logger().info("确认带起只升升降 6 cm")
         if not self._follow_lift(target, 0.16):
-            return True
+            return False
         if self.pick_prim is None or self.pick_rest_z is None:
-            return True
+            return False
         self.sleep(0.2)
         for _ in range(6):
             rclpy.spin_once(self, timeout_sec=0.05)
         pose = self.box_poses.get(self.pick_prim)
-        if pose is None:
-            return True
+        if pose is None or not self._poses_fresh():
+            return False
         if pose[2] >= self.pick_rest_z + 0.03:
             self.get_logger().info(f"纸箱已离架，箱心高度 {pose[2]:.3f}")
             return True
@@ -720,25 +888,33 @@ class StackBoxes(Node):
         return False
 
     def _tuck_carried(self, carry_z):
-        """Hold the box beside this shoulder so the other hand can use the stand."""
+        """Leave the chest in front, move outboard, then pull the box back.
+
+        A diagonal toward the shoulder sweeps the box through the waist even
+        when both endpoint tool poses are reachable.
+        """
         sign = 1.0 if self.side == "left" else -1.0
-        tucked = None
-        for target in ((0.16, sign * 0.32), (0.24, sign * 0.46), (0.12, sign * 0.20)):
-            if self._move_carry_xy(target[0], target[1], carry_z, "收臂"):
-                tucked = target
-                break
-        if tucked is None:
-            self.get_logger().error("箱子抬起来了，但收不到肩膀旁边")
+        pose = self._measured_tool()
+        if pose is None:
             return False
-        self._move_tool(tucked[0], tucked[1], max(carry_z, 0.62), "行车高度", carry_tolerance=0.06)
-        return True
+        if self._arm().holding:
+            # First go outboard while the box remains in front of the waist.
+            if not self._move_carry_xy(.45, sign*.32, carry_z, "移到腰侧"):
+                return False
+        if not self._move_carry_xy(.24, sign*.46, carry_z, "收臂"):
+            self.get_logger().error("箱子未能沿腰部外侧收回")
+            return False
+        return self._move_tool(
+            .24, sign*.46, max(carry_z,.76+self._lift_now()),
+            "行车高度", carry_tolerance=.035,
+        )
 
     def _place_held(self, slot, plan):
         self._use(plan.arm)
         self.waist_yaw = float(plan.waist)
         self.place_path = []
         park = plan.base
-        place_z = tool_z_for_place(slot)
+        place_z = slot.z + self._arm().box_drop
         self.get_logger().info(
             f"{'左手' if plan.arm == 'left' else '右手'}开到底盘 "
             f"({park[0]:.3f}, {park[1]:.3f}) 腰 {self.waist_yaw:.2f}，放格子 {slot.index}"
@@ -750,16 +926,16 @@ class StackBoxes(Node):
         support = self._measured_support(slot)
         if support is not None:
             world_x, world_y = support[0], support[1]
-            place_z = support[2] + BOX[2] + carried_offset()
+            place_z = support[2] + BOX[2] + self._arm().box_drop
             self.get_logger().info(
-                f"按下层实测位姿堆叠 ({support[0]:.3f}, {support[1]:.3f}, {support[2]:.3f})"
+                f"按下层实测高度堆叠，下层最高箱心 z={support[2]:.3f}，位置仍取格子 ({slot.x:.3f}, {slot.y:.3f})"
             )
         sx, sy = self._into_base(world_x, world_y)
         self.place_supports = {"stand", "pallet"}
         for name, center, _size in self.world_boxes:
             if not name.startswith("placed_"):
                 continue
-            if math.hypot(center[0] - slot.x, center[1] - slot.y) < 0.04 and center[2] < slot.z - 0.04:
+            if under_slot(slot, center) and center[2] < slot.z - 0.04:
                 self.place_supports.add(name)
         self._publish_collision_matrix()
         self.get_logger().info(
@@ -793,7 +969,12 @@ class StackBoxes(Node):
             self.get_logger().error("撤离未通过路径或实测位置校验，停止；具体位置见前面的日志。")
             return False
         self.get_logger().info(f"已放下格子 {slot.index}")
-        return True
+        pose = self._measured_tool()
+        if pose is None:
+            return False
+        # Retract before chassis travel, so the empty cup cannot sweep the
+        # next box or the newly placed stack during the return trip.
+        return self._tuck_carried(max(pose.position.z, .76))
 
     def _record_place_waypoint(self):
         arm = self._current_arm()
@@ -904,8 +1085,8 @@ class StackBoxes(Node):
         cz, sz = math.cos(half), math.sin(half)
         qx, qy, qz, qw = quat
         return (
-            cz * qx + sz * qy,
-            cz * qy - sz * qx,
+            cz * qx - sz * qy,
+            cz * qy + sz * qx,
             sz * qw + cz * qz,
             cz * qw - sz * qz,
         )
@@ -961,6 +1142,35 @@ class StackBoxes(Node):
             self._send_wheels(self.steer_hold, [0.0, 0.0, 0.0, 0.0])
             self.sleep(0.05)
 
+    def _carry_intact(self, arm):
+        """True while the carried box is still up. One false grip sample is not a drop.
+
+        The holding topic can flicker while the chassis yaws. Stop only when
+        the prim has actually fallen, or the cup stays open and the pose is gone.
+        """
+        now = self.get_clock().now()
+        fresh = arm.grip_time is not None and (now - arm.grip_time).nanoseconds < 2.0e9
+        pose = None if arm.box_index is None else self.box_poses.get(arm.box_index)
+        airborne = pose is not None and self._poses_fresh() and pose[2] > 0.55
+        if arm.grip is True and fresh:
+            arm.grip_bad = None
+            return True
+        if airborne:
+            if getattr(arm, "grip_warn", None) is None:
+                arm.grip_warn = now
+                self.get_logger().warn(
+                    f"{arm.name} 吸附话题中断，箱心仍在 {pose[2]:.3f}，继续行驶"
+                )
+            return True
+        if getattr(arm, "grip_bad", None) is None:
+            arm.grip_bad = now
+        if (now - arm.grip_bad).nanoseconds < 0.4e9:
+            return True
+        height = "没有箱心" if pose is None else f"箱心 {pose[2]:.3f}"
+        reason = "反馈超时" if not fresh else "吸盘已松开"
+        self.get_logger().error(f"{arm.name} {reason}，{height}，停止底盘")
+        return False
+
     def _drive_base(self, x, y, yaw):
         """Holonomic drive. A straight line that crosses the pallet goes around it."""
         if self.base_pose is None:
@@ -969,34 +1179,62 @@ class StackBoxes(Node):
             self.get_logger().error("没有底盘位姿，不能开过去")
             return False
         goal = (float(x), float(y), float(yaw))
-        points = route_around(self.base_pose, goal)
+        final_tolerance = 0.018
+        if math.dist(self.base_pose[:2],goal[:2]) <= final_tolerance and abs(math.atan2(
+            math.sin(self.base_pose[2]-yaw), math.cos(self.base_pose[2]-yaw))) <= .03:
+            self._stop_wheels()
+            return True
+        try:
+            points = route_around(self.base_pose, goal)
+        except NoBasePose as error:
+            self._stop_wheels()
+            self.get_logger().error(str(error))
+            return False
         if len(points) > 1:
             self.get_logger().info(f"底盘绕开托盘，途经 {len(points) - 1} 个拐角")
+        # Route search is CPU work; consume queued sensor samples before
+        # evaluating holding freshness at the first drive step.
+        self.sleep(.1)
         last = len(points) - 1
         for index, point in enumerate(points):
             # The last park is what puts the slot inside the measured cup
             # window. Four centimetres short turns a reachable (0.16, 0.56)
             # into a pose the wrist cannot lower onto.
             if index == last:
-                ok = self._drive_straight(*point, pos_tol=0.018, yaw_tol=0.03)
+                ok = self._drive_straight(*point, pos_tol=final_tolerance, yaw_tol=0.03)
             else:
-                ok = self._drive_straight(*point)
+                ok = self._drive_straight(*point, pos_tol=0.04, yaw_tol=0.06)
             if not ok:
                 return False
         return True
 
     def _drive_straight(self, x, y, yaw, pos_tol=0.04, yaw_tol=0.06):
-        deadline = self.get_clock().now() + Duration(seconds=45.0)
+        # A carried box yaws at about 0.08 rad/s once the wheels finish aligning.
+        # The old fixed 45 s budget was spent on that spin, so the chassis was
+        # still 5 cm short when the deadline cancelled the final creep.
+        deadline = None
         settled = 0
         hold = list(self.steer_hold)
         last_report = self.get_clock().now()
         scene_tick = 0
-        pos_tol = 0.04
-        yaw_tol = 0.06
-        while rclpy.ok() and self.get_clock().now() < deadline:
+        park_heading = None
+        while rclpy.ok() and (deadline is None or self.get_clock().now() < deadline):
+            for arm in self._arms.values():
+                if arm.holding and not self._carry_intact(arm):
+                    self._stop_wheels()
+                    return False
             if self.base_pose is None:
                 self.sleep(0.05)
                 continue
+            if deadline is None:
+                base_x, base_y, base_yaw = self.base_pose
+                yaw_error = abs(math.atan2(math.sin(yaw - base_yaw), math.cos(yaw - base_yaw)))
+                distance = math.hypot(x - base_x, y - base_y)
+                carrying_now = any(arm.holding for arm in self._arms.values())
+                yaw_rate = 0.08 if carrying_now else 0.35
+                cruise = 0.12 if carrying_now else 0.35
+                budget = min(100.0, max(45.0, 20.0 + yaw_error / yaw_rate + distance / cruise))
+                deadline = self.get_clock().now() + Duration(seconds=budget)
             base_x, base_y, base_yaw = self.base_pose
             error_x = x - base_x
             error_y = y - base_y
@@ -1022,21 +1260,51 @@ class StackBoxes(Node):
             # Spin to the waypoint heading before rolling. Turning while
             # translating moves the steer target every cycle, the alignment
             # gate then cuts the drive, and the chassis crawls at ~0.15 m/s.
-            if abs(error_yaw) > 0.12:
+            carrying = any(arm.holding for arm in self._arms.values())
+            # A 0.9 rad/s spin yaws the cup faster than the box can follow.
+            # The suction constraint breaks at 15 degrees and the box drops.
+            turn_cap = 0.20 if carrying else 0.9
+            # Inside 12 cm, a few degrees of leftover yaw makes the last
+            # step a strafe. The steer angles jump, and driving before they
+            # arrive cancels out, so the chassis sits still.
+            if abs(error_yaw) > 0.12 or (dist < 0.12 and abs(error_yaw) > yaw_tol):
+                park_heading = None
                 forward = 0.0
                 lateral = 0.0
-                turn = max(-0.9, min(0.9, 1.8 * error_yaw))
+                turn = max(-turn_cap, min(turn_cap, (0.6 if carrying else 1.8) * error_yaw))
             elif dist > pos_tol:
                 turn = 0.0
                 speed = math.hypot(forward, lateral)
-                limit = 0.55 if dist > 0.25 else 0.16
+                limit = (0.22 if carrying else 0.55) if dist > 0.25 else 0.08
                 if speed > limit and speed > 1.0e-6:
                     forward *= limit / speed
                     lateral *= limit / speed
+                elif dist < 0.08 and 1.0e-6 < speed < 0.05:
+                    # The raw command equals the remaining distance, so inside
+                    # 8 cm it drops below what the wheels can creep. Hold 5 cm/s
+                    # until the 1.8 cm window, then stop.
+                    forward *= 0.05 / speed
+                    lateral *= 0.05 / speed
+                # Keep one steer solution through the straight approach.
+                # Refreshing it every cycle flips a tire by 180 degrees and the
+                # alignment gate then zeroes the drive, so the chassis stalls
+                # about 5 cm short of the park.
+                speed = math.hypot(forward, lateral)
+                heading = math.atan2(lateral, forward)
+                if park_heading is None:
+                    park_heading = heading
+                elif abs(math.atan2(
+                    math.sin(heading - park_heading), math.cos(heading - park_heading)
+                )) < 0.40:
+                    forward = speed * math.cos(park_heading)
+                    lateral = speed * math.sin(park_heading)
+                else:
+                    park_heading = heading
             else:
+                park_heading = None
                 forward = 0.0
                 lateral = 0.0
-                turn = 0.0 if abs(error_yaw) < yaw_tol else max(-0.6, min(0.6, 1.4 * error_yaw))
+                turn = 0.0 if abs(error_yaw) < yaw_tol else max(-turn_cap, min(turn_cap, (0.6 if carrying else 1.4) * error_yaw))
             # Keep the steer target chosen for this twist. Re-seeding it from
             # the measured angle every cycle flips a wheel between the two
             # equivalent headings, so the drive speed stays at zero.
@@ -1047,8 +1315,6 @@ class StackBoxes(Node):
             aligned = measured is not None and all(
                 steer_error(current, target) <= 0.12 for current, target in zip(measured, angles)
             )
-            if dist < 0.06:
-                aligned = True
             if not aligned:
                 drives = [0.0, 0.0, 0.0, 0.0]
             now = self.get_clock().now()
@@ -1262,7 +1528,7 @@ class StackBoxes(Node):
         horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
         if horizontal > 0.015:
             self.get_logger().warn(f"到位后横向还差 {horizontal * 100:.1f} cm，手臂微调一次")
-            self._move_tool_direct(x, y, pose.position.z, "放置对准", 0.015, False, wait=4.0)
+            self._aim_arm(x, y, pose.position.z, pose.position.z, correct_bias=True)
             pose = self._measured_tool()
             if pose is None:
                 return False
@@ -1282,15 +1548,15 @@ class StackBoxes(Node):
             horizontal = math.hypot(pose.position.x - x, pose.position.y - y)
             high = pose.position.z - z
             self._log_tool("放置", x, y, z)
-            if horizontal <= 0.018 and abs(high) <= 0.008:
+            if horizontal <= 0.02 and abs(high) <= 0.008:
                 self._record_place_waypoint()
                 return True
             # Under 2 cm is already inside the release gate. Nudging a
             # fully stretched arm here never closes the last centimetre
             # and blocks the lift drop.
-            if horizontal > 0.018:
+            if horizontal > 0.02:
                 aim_z = z if high < 0.025 else pose.position.z
-                if not self._aim_arm(x, y, aim_z, pose.position.z):
+                if not self._aim_arm(x, y, aim_z, pose.position.z, correct_bias=True):
                     break
                 pose = self._measured_tool()
                 if pose is None:
@@ -1308,7 +1574,7 @@ class StackBoxes(Node):
                 if self._lift_now() > 0.008 and not self._follow_lift(0.0, 0.15):
                     return False
                 self.get_logger().info("升降已到最低，剩下的高度由手臂平滑补上")
-                if not self._aim_arm(x, y, z, pose.position.z):
+                if not self._aim_arm(x, y, z, pose.position.z, correct_bias=True):
                     break
                 continue
             before_z = pose.position.z
@@ -1322,7 +1588,7 @@ class StackBoxes(Node):
                 self.get_logger().warn(
                     f"升降降了 {step * 100:.1f} cm，末端只降了 {dropped * 100:.1f} cm，改由手臂下降"
                 )
-                if not self._aim_arm(x, y, z, pose.position.z):
+                if not self._aim_arm(x, y, z, pose.position.z, correct_bias=True):
                     break
         pose = self._measured_tool()
         if pose is None:
@@ -1335,16 +1601,37 @@ class StackBoxes(Node):
         self._log_tool("放置偏差过大", x, y, z)
         return False
 
-    def _aim_arm(self, x, y, z, fallback_z):
-        """Smooth arm move at the current lift. Tries the target height first."""
+    def _aim_arm(self, x, y, z, fallback_z, correct_bias=False):
+        """Smooth arm correction, optionally compensating measured load bias."""
         lift = self._lift_now()
-        solved = self._solve_arm(x, y, z, fixed_lift=lift)
-        if solved is None and abs(z - fallback_z) > 0.005:
-            solved = self._solve_arm(x, y, fallback_z, fixed_lift=lift)
+        solved = self._solve_arm(x,y,z,fixed_lift=lift)
+        used_z = z
+        if solved is None and abs(z-fallback_z) > .005:
+            used_z = fallback_z
+            solved = self._solve_arm(x,y,used_z,fixed_lift=lift)
         if solved is None:
             self.get_logger().warn("放下时手臂没有逆解")
             return False
-        return self._follow_arm(solved, 0.6)
+        if not self._follow_arm(solved,.6):
+            return False
+        if correct_bias:
+            # Repeating the same IK target does not remove a loaded joint's
+            # steady tracking error. Offset the requested pose once, retaining
+            # the same elbow and still checking the measured final position.
+            pose = self._measured_tool()
+            if pose is None:
+                return False
+            error=(x-pose.position.x,y-pose.position.y,used_z-pose.position.z)
+            gap=math.sqrt(sum(v*v for v in error))
+            if .012 < gap <= .04:
+                adjusted=self._solve_arm(
+                    x+error[0],y+error[1],used_z+error[2],.25,
+                    fixed_lift=self._lift_now(),prefer=self._current_arm(),
+                )
+                if adjusted is not None:
+                    self.get_logger().info(f"按实测负载偏差补偿 {gap*100:.1f} cm")
+                    return self._follow_arm(adjusted,.25)
+        return True
 
     def _current_arm(self):
         if self.joint_state is None:
@@ -1411,10 +1698,9 @@ class StackBoxes(Node):
         pose.pose.position.z = float(z)
         # Rx(180). w must be set; the message default is 1, and (1,0,0,1)
         # normalizes to Rx(90), which leaves the seal facing sideways.
-        pose.pose.orientation.x = 1.0
-        pose.pose.orientation.y = 0.0
-        pose.pose.orientation.z = 0.0
-        pose.pose.orientation.w = 0.0
+        base_yaw = self.base_pose[2] if self.base_pose is not None else 0.0
+        (pose.pose.orientation.x, pose.pose.orientation.y,
+         pose.pose.orientation.z, pose.pose.orientation.w) = downward_quaternion(base_yaw)
         seeds = []
         if self._arm().seed is not None:
             seeds.append(self._arm().seed)
@@ -1453,6 +1739,7 @@ class StackBoxes(Node):
                 request.ik_request.timeout.sec = 0
                 request.ik_request.timeout.nanosec = 200000000
                 request.ik_request.robot_state = RobotState()
+                request.ik_request.robot_state.is_diff = True
                 request.ik_request.robot_state.joint_state = self._ik_seed(seed, lift)
                 future = self.ik.call_async(request)
                 rclpy.spin_until_future_complete(self, future)
@@ -1462,6 +1749,7 @@ class StackBoxes(Node):
                     continue
                 check = GetStateValidity.Request()
                 check.robot_state = result.solution
+                check.robot_state.is_diff = True
                 check.group_name = self._arm().group
                 checked = self.validity.call_async(check)
                 rclpy.spin_until_future_complete(self, checked)
@@ -1602,6 +1890,8 @@ class StackBoxes(Node):
             f"放置停稳 横向 {horizontal * 100:.1f} cm，高度差 {high * 100:.1f} cm，松开"
         )
         world_x, world_y = self._from_base(current[0], current[1])
+        if not self._held_box_aligned():
+            return None
         self.set_suction(False)
         # Let the box sit on the riser before the cup lifts away.
         self.sleep(0.6)
@@ -1719,7 +2009,7 @@ class StackBoxes(Node):
                 self._log_tool(f"{label} 已对准", x, y, z)
                 return True
             self.get_logger().warn(f"{label} 还没对准，再走一次")
-            self._move_tool_direct(x, y, z, label, tolerance, False, wait=4.0)
+            self._aim_arm(x, y, z, z, correct_bias=True)
         if self._at_tool(x, y, z, tolerance):
             self._log_tool(f"{label} 已对准", x, y, z)
             return True
@@ -1918,8 +2208,9 @@ class StackBoxes(Node):
         pose.position.y = float(y)
         pose.position.z = float(z)
         # Rx(180): tool +Z, the seal axis, points down.
-        pose.orientation.x = 1.0
-        pose.orientation.w = 0.0
+        base_yaw = self.base_pose[2] if self.base_pose is not None else 0.0
+        (pose.orientation.x, pose.orientation.y, pose.orientation.z,
+         pose.orientation.w) = downward_quaternion(base_yaw)
         position = PositionConstraint()
         position.header.frame_id = "world"
         position.link_name = self._arm().tool
@@ -2132,6 +2423,18 @@ class StackBoxes(Node):
         return result is not None and result.success
 
     def _attach_carried(self):
+        arm = self._arm()
+        measured = self.box_poses.get(arm.box_index)
+        tool = self._measured_tool()
+        if measured is None or len(measured) != 7 or tool is None or not self._poses_fresh():
+            self.get_logger().error("缺少真实抓取位姿，不能建立附着箱子")
+            return False
+        bx,by = self._into_base(*measured[:2])
+        quat = self._quat_into_base(measured[3:])
+        parent = (tool.position.x,tool.position.y,tool.position.z,
+                  tool.orientation.x,tool.orientation.y,tool.orientation.z,tool.orientation.w)
+        grasp = relative_pose(parent,(bx,by,measured[2],*quat))
+        arm.box_drop = tool.position.z-measured[2]
         remove = self._box("pickup", pickup_center(), BOX)
         remove.operation = CollisionObject.REMOVE
         arm = self._arm()
@@ -2145,10 +2448,11 @@ class StackBoxes(Node):
         # still blocks a descent that has drifted more than 2 cm into one.
         primitive.dimensions = [BOX[0] - 0.04, BOX[1] - 0.04, BOX[2]]
         pose = Pose()
-        # Box center is along tool +Z. Rx(180) keeps the box upright in the world.
-        pose.position.z = carried_offset()
-        pose.orientation.x = 1.0
-        pose.orientation.w = 0.0
+        # Preserve the actual physical box pose instead of assuming a
+        # centered, perfectly aligned grasp on every pickup.
+        pose.position.x,pose.position.y,pose.position.z = grasp[:3]
+        (pose.orientation.x,pose.orientation.y,pose.orientation.z,
+         pose.orientation.w) = grasp[3:]
         carried.primitives = [primitive]
         carried.primitive_poses = [pose]
         carried.operation = CollisionObject.ADD
@@ -2162,13 +2466,13 @@ class StackBoxes(Node):
         scene.robot_state.attached_collision_objects = [attached]
         scene.robot_state.is_diff = True
         if not self._call_scene(scene):
-            return
+            return False
         self._arm().holding = True
         self.place_supports = {"stand", "pallet"}
         self.world_boxes = [item for item in self.world_boxes if item[0] != "pickup"]
         if "pickup" in self.scene_ids:
             self.scene_ids.remove("pickup")
-        self._publish_collision_matrix()
+        return self._publish_collision_matrix()
 
     def _detach_at(self, index, center):
         arm = self._arm()
@@ -2178,7 +2482,8 @@ class StackBoxes(Node):
         attached = AttachedCollisionObject()
         attached.link_name = arm.tool
         attached.object = remove
-        placed_id = f"placed_{index}"
+        box_index = arm.box_index if arm.box_index is not None else index
+        placed_id = f"placed_{box_index}"
         local_x, local_y = self._into_base(center[0], center[1])
         placed = self._box(placed_id, (local_x, local_y, center[2]), BOX)
         scene = PlanningScene()
@@ -2219,6 +2524,7 @@ class StackBoxes(Node):
             )
             return False
         self._arm().holding = False
+        self._arm().box_index = None
         self.world_boxes.append((placed_id, center, BOX))
         self.scene_ids.append(placed_id)
         if not self._publish_collision_matrix():

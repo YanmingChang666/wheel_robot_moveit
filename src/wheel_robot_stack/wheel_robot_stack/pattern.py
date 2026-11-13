@@ -31,9 +31,19 @@ from functools import lru_cache
 
 
 BOX = (0.351, 0.287, 0.105)
-# Free space left between neighbouring boxes. Flush faces snag during the
-# last centimetres of the lift drop and fold the arm, so the cup stops high.
-PACK_GAP = 0.015
+# Free space left between neighbouring boxes. A 15 mm gap is smaller than the
+# measured place error, so a box lands on its neighbour and the next drop stalls.
+PACK_GAP = 0.030
+# Closest a box may come to the pallet edge. The grid is centered, so the real
+# edge clearance is whatever the pallet has left after three boxes and two gaps.
+EDGE_MARGIN = 0.010
+# Largest shift between two neighbouring layers that the arms can still serve.
+# Found by sweeping the A/B offsets in 2.5 mm steps against either_arm_reaches:
+# up to 0.070 m in x every cell that is reachable with centered layers stays
+# reachable; in y the limit (0.100 m) is above what the pallet allows.
+LAYER_SHIFT_ARM_LIMIT = (0.070, 0.100)
+# Round the number of layers down to an even count when set.
+EVEN_LAYERS = False
 PALLET_FOOTPRINT = (1.200, 1.000)
 PALLET_MAX_HEIGHT = 1.160
 PALLET_THICKNESS = 0.125
@@ -52,7 +62,8 @@ RISER_HEIGHT = 0.08
 PALLET_TOP_Z = PALLET_THICKNESS + RISER_HEIGHT
 # Pickup stand stays at the original bench height.
 STAND_TOP_Z = 0.35
-PICKUP_XY = (0.55, 0.18)
+STAND_XY = (0.55, 0.18)
+PICKUP_XY = (0.50, 0.18)
 STAND_SIZE = (0.50, 0.36, 0.30)
 # Left-arm shoulder at lift 0 and waist yaw 0, from the wheel-robot URDF.
 SHOULDER_XY = (0.13755, 0.1212)
@@ -222,15 +233,42 @@ def pack_layer(pallet_x, pallet_y, box_x, box_y):
 
 
 def layer_count(box_z=BOX[2], max_height=PALLET_MAX_HEIGHT):
-    return int((max_height + 1e-9) // box_z)
+    count = int((max_height + 1e-9) // box_z)
+    if EVEN_LAYERS and count % 2:
+        count -= 1
+    return count
+
+
+def layer_shift():
+    """(x, y) distance between the two alternating layer positions, in metres.
+
+    The room left by the 3 x 3 grid and its gaps, minus an edge margin on both
+    sides, is the most one layer can move before a box hangs over the pallet.
+    The x shift is also capped by what the arms can reach.
+    """
+    room_x = PALLET_FOOTPRINT[0] - 3 * BOX[0] - 2 * PACK_GAP - 2 * EDGE_MARGIN
+    room_y = PALLET_FOOTPRINT[1] - 3 * BOX[1] - 2 * PACK_GAP - 2 * EDGE_MARGIN
+    return (
+        max(0.0, min(room_x, LAYER_SHIFT_ARM_LIMIT[0])),
+        max(0.0, min(room_y, LAYER_SHIFT_ARM_LIMIT[1])),
+    )
+
+
+def layer_offset(level):
+    """Offset of a whole layer from the centered grid.
+
+    Every layer stays on the pallet center. Shifting even layers toward -Y
+    left about 10 mm at the near edge and a large empty band on +Y.
+    """
+    del level
+    return (0.0, 0.0)
 
 
 def all_slots():
-    """Nine boxes per layer, centered on the pallet, layers from the bottom.
+    """Nine boxes per layer, every layer on the same centered grid.
 
-    The long side of the box runs along the pallet's 1.2 m side, so a 3 by 3
-    grid fits with an equal margin on every edge. A layer is finished before
-    the next one starts.
+    The long side of the box runs along the pallet's 1.2 m side. A layer is
+    finished before the next one starts, and each box sits on the box below it.
     """
     columns = 3
     rows = 3
@@ -240,19 +278,28 @@ def all_slots():
     margin_y = (PALLET_FOOTPRINT[1] - rows * cell_y) / 2.0
     slots = []
     for level in range(layer_count()):
+        off_x, off_y = layer_offset(level)
         for row in range(rows):
             for col in range(columns):
                 slots.append(
                     Slot(
                         index=len(slots),
                         layer=level,
-                        x=PALLET_ORIGIN[0] + margin_x + (col + 0.5) * cell_x,
-                        y=PALLET_ORIGIN[1] + margin_y + (row + 0.5) * cell_y,
+                        x=PALLET_ORIGIN[0] + margin_x + (col + 0.5) * cell_x + off_x,
+                        y=PALLET_ORIGIN[1] + margin_y + (row + 0.5) * cell_y + off_y,
                         z=PALLET_TOP_Z + (level + 0.5) * BOX[2],
                         rotated=False,
                     )
                 )
     return slots
+
+
+def under_slot(slot, center, margin=0.01):
+    """True when a box centered at ``center`` overlaps the slot's footprint."""
+    return (
+        abs(center[0] - slot.x) < BOX[0] - margin
+        and abs(center[1] - slot.y) < BOX[1] - margin
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +319,8 @@ def _rect_overlap(ax, ay, ahw, ahh, rect):
 def _keep_out_rects():
     pallet = (PALLET_ORIGIN[0], PALLET_ORIGIN[1], PALLET_FOOTPRINT[0], PALLET_FOOTPRINT[1])
     stand = (
-        PICKUP_XY[0] - STAND_SIZE[0] / 2.0,
-        PICKUP_XY[1] - STAND_SIZE[1] / 2.0,
+        STAND_XY[0] - STAND_SIZE[0] / 2.0,
+        STAND_XY[1] - STAND_SIZE[1] / 2.0,
         STAND_SIZE[0],
         STAND_SIZE[1],
     )
@@ -295,10 +342,10 @@ def reach_distance(base, slot):
     return math.hypot(slot.x - sx, slot.y - sy)
 
 
-def _footprint_hits(base, rects):
+def _footprint_hits(base, rects, margin=BASE_MARGIN):
     c, s = abs(math.cos(base[2])), abs(math.sin(base[2]))
-    half_x = c * BASE_HALF[0] + s * BASE_HALF[1] + BASE_MARGIN
-    half_y = s * BASE_HALF[0] + c * BASE_HALF[1] + BASE_MARGIN
+    half_x = c * BASE_HALF[0] + s * BASE_HALF[1] + margin
+    half_y = s * BASE_HALF[0] + c * BASE_HALF[1] + margin
     return any(_rect_overlap(base[0], base[1], half_x, half_y, rect) for rect in rects)
 
 
@@ -423,7 +470,7 @@ def _nearest_plans(x, y, reach, allow_stand, home_weight=0.0, extra_margin=0.0):
 # place height with the seal down and the waist straight. Outside this window
 # the shoulder can be close while the wrist still has no solution.
 _PLACE_X = (0.08, 0.16, 0.24, 0.32)
-_PLACE_Y = (0.32, 0.40, 0.44, 0.48, 0.52, 0.56)
+_PLACE_Y = (0.32, 0.40, 0.44, 0.48, 0.50, 0.52, 0.53, 0.54, 0.56)
 
 
 def _place_local_ok(local_x, local_y):
@@ -435,29 +482,35 @@ def _place_local_ok(local_x, local_y):
 
 
 @lru_cache(maxsize=None)
-def _arm_options(x, y, reach):
-    """Chassis pose that puts the slot inside the measured downward workspace."""
-    del reach
+def _arm_candidates(x, y, reach):
     found = {}
     for arm, sign in (("left", 1.0), ("right", -1.0)):
-        best = None
+        choices = []
         for yaw in SIDE_YAWS:
+            best = None
             for local_x in _PLACE_X:
                 for local_y in _PLACE_Y:
                     if not _place_local_ok(local_x, local_y):
                         continue
-                    dx, dy = _rotate(local_x, sign * local_y, yaw)
-                    base = (x - dx, y - dy, yaw)
+                    dx, dy = _rotate(local_x, sign*local_y, yaw)
+                    base = (x-dx, y-dy, yaw)
                     if not base_is_clear(base):
                         continue
                     sx, sy = shoulder_world(base, arm, 0.0)
-                    distance = math.hypot(x - sx, y - sy)
-                    cost = abs(local_x - 0.16) + abs(local_y - 0.44)
+                    distance = math.hypot(x-sx, y-sy)
+                    cost = abs(local_x-.16)+abs(local_y-.44)
                     if best is None or cost < best[0]:
-                        best = (cost, ArmPlan(arm, base, 0.0, distance))
-        if best is not None:
-            found[arm] = best[1]
+                        best = cost, ArmPlan(arm, base, 0.0, distance)
+            if best is not None:
+                choices.append(best)
+        if choices:
+            found[arm] = tuple(plan for _, plan in sorted(choices, key=lambda item:item[0]))
     return found
+
+
+@lru_cache(maxsize=None)
+def _arm_options(x, y, reach):
+    return {arm:plans[0] for arm, plans in _arm_candidates(x, y, reach).items()}
 
 
 def arm_options(x, y, reach=PLACE_REACH):
@@ -486,93 +539,115 @@ def unreachable_slots(reach=PLACE_REACH, **kwargs):
     return [slot for slot in all_slots() if not either_arm_reaches(slot.x, slot.y, reach)]
 
 
-def carry_pairs(slots, reach=PLACE_REACH):
-    """Pair slots so the two hands can pick, drive, and place in order.
+def carry_pairs(slots, reach=PLACE_REACH, pickup_base=None):
+    """Greedily minimize each trip's routed distance, respecting layer/row order.
 
-    Place order stays far-row first. A pair is two slots that different arms
-    can reach. A slot the other arm cannot reach is placed alone.
+    Compare opposite-arm assignments and parking headings using the actual
+    obstacle route, including the return to the shared pickup station.
+    This is a per-trip optimization, not a global traveling-salesman solution.
     """
-    pending = []
-    for slot in slots:
-        options = arm_options(slot.x, slot.y, reach)
-        if options:
-            pending.append((slot, options))
-    used = set()
-    pairs = []
-    for index, (slot, options) in enumerate(pending):
-        if index in used:
-            continue
-        ranked = sorted(options, key=lambda arm: options[arm].distance)
-        partner = None
-        chosen = None
-        for arm in ranked:
+    station = tuple(pickup_base or pick_plan("left").base)
+    pending = list(slots)
+    batches = []
+    while pending:
+        first = pending.pop(0)
+        options = _arm_candidates(first.x, first.y, reach)
+        partners = [(i, s) for i,s in enumerate(pending) if s.layer == first.layer]
+        same_row = [(i,s) for i,s in partners if abs(s.y-first.y) < 1e-6]
+        if same_row:
+            partners = same_row
+        best = None
+        for arm, plans in options.items():
             other = "right" if arm == "left" else "left"
-            for later in range(index + 1, len(pending)):
-                if later in used:
-                    continue
-                if other in pending[later][1]:
-                    partner = later
-                    chosen = arm
-                    break
-            if partner is not None:
-                break
-        used.add(index)
-        if partner is None:
-            pairs.append([(slot, options[ranked[0]])])
+            for i, second in partners:
+                choices = _arm_candidates(second.x, second.y, reach).get(other, ())
+                for a in plans:
+                    for b in choices:
+                        cost = (route_distance(station,a.base)+route_distance(a.base,b.base)
+                                + route_distance(b.base,station))
+                        if math.isfinite(cost) and (best is None or cost < best[0]):
+                            best = cost, i, [(first,a),(second,b)]
+        if best is not None:
+            _, i, batch = best
+            pending.pop(i)
+            batches.append(batch)
             continue
-        used.add(partner)
-        other = "right" if chosen == "left" else "left"
-        other_slot, other_options = pending[partner]
-        pairs.append([(slot, options[chosen]), (other_slot, other_options[other])])
-    return pairs
+        choices = [(route_distance(station,p.base)*2, p)
+                   for plans in options.values() for p in plans]
+        choices = [(cost,p) for cost,p in choices if math.isfinite(cost)]
+        if not choices:
+            raise NoBasePose(f"格子 {first.index} 没有可行往返路线")
+        _, plan = min(choices, key=lambda item:item[0])
+        batches.append([(first,plan)])
+    return batches
 
 
 @lru_cache(maxsize=None)
 def pick_plan(arm):
-    """Chassis pose that puts this cup over the pickup stand.
+    """Both cups use one stationary base, with the stand on the midline.
 
-    The left cup already picks from the spawn pose. The right cup uses the
-    mirror of that pose, facing the stand from the east, with the same
-    shoulder distance. A searched stop either sat on the bench or folded the
-    right arm into the waist.
+    Only position once on arrival; do not drive or turn between the two picks.
+    The two wrist-down chains were checked kinematically at local (0.55, 0).
+    Collision feasibility remains a runtime MoveIt check.
     """
-    stand_x, stand_y = PICKUP_XY
-    if arm == "left":
-        base = (0.0, 0.0, 0.0)
-    else:
-        # Spawn sees the stand at about (0.55, +0.18). The right shoulder is
-        # the mirror, so the stand has to sit at (0.55, -0.18) in the base.
-        yaw = math.pi
-        dx, dy = _rotate(0.55, -0.18, yaw)
-        base = (stand_x - dx, stand_y - dy, yaw)
+    if arm not in ARM_SHOULDER:
+        raise ValueError(arm)
+    base = (0.0, PICKUP_XY[1], 0.0)
     sx, sy = shoulder_world(base, arm, 0.0)
-    distance = math.hypot(stand_x - sx, stand_y - sy)
-    return ArmPlan(arm, base, 0.0, distance)
+    return ArmPlan(arm, base, 0.0, math.hypot(PICKUP_XY[0]-sx,PICKUP_XY[1]-sy))
+
+
+@lru_cache(maxsize=8192)
+def route_distance(start, goal):
+    try:
+        route = route_around(start, goal)
+    except NoBasePose:
+        return float("inf")
+    return sum(math.hypot(b[0]-a[0],b[1]-a[1])
+               for a,b in zip((start,*route),route))
 
 
 def _segment_clear(a, b):
-    """True when the chassis can drive from ``a`` to ``b`` without a keep-out.
+    """Check translation AND intermediate chassis headings along an edge.
 
-    Home sits against the pickup stand, so the footprint model marks that
-    parked pose as touching it. The first and last 30 cm of a segment that
-    begins or ends on such a pose are allowed. A pallet crossing in between
-    is not.
+    Only the known pickup corridor may use the extra safety margin near the
+    stand; the physical footprint and pallet clearance still must be clear.
     """
-    length = math.hypot(b[0] - a[0], b[1] - a[1])
-    steps = max(1, int(length / 0.08))
-    depart = 0.30 if not base_is_clear(a) else 0.0
-    arrive = 0.30 if not base_is_clear(b) else 0.0
-    for index in range(steps + 1):
-        fraction = index / steps
-        travelled = length * fraction
-        if travelled <= depart or length - travelled <= arrive:
-            continue
-        pose = (
-            a[0] + (b[0] - a[0]) * fraction,
-            a[1] + (b[1] - a[1]) * fraction,
-            a[2] if fraction < 0.5 else b[2],
-        )
-        if not base_is_clear(pose):
+    length = math.hypot(b[0]-a[0],b[1]-a[1])
+    turn = math.atan2(math.sin(b[2]-a[2]),math.cos(b[2]-a[2]))
+    def pickup_corridor(pose):
+        yaw = math.atan2(math.sin(pose[2]),math.cos(pose[2]))
+        return abs(pose[0]) <= .025 and -.025 <= pose[1] <= PICKUP_XY[1]+.025 and abs(yaw) <= .04
+    depart = .30 if pickup_corridor(a) else 0.
+    arrive = .30 if pickup_corridor(b) else 0.
+    def clear_pose(pose,travelled):
+        if base_is_clear(pose):
+            return True
+        near_pickup=((depart>0 and travelled<=depart) or (arrive>0 and length-travelled<=arrive))
+        pallet, stand = _keep_out_rects()
+        # Margin 0 is the body itself. The 5 cm keep-out is only a buffer.
+        if _footprint_hits(pose, (pallet,), margin=0.0):
+            return False
+        if _footprint_hits(pose, (stand,), margin=0.0):
+            return False
+        # A side park sits inside the 5 cm keep-out but does not overlap the
+        # pallet. It may roll straight out. It may not spin there: the
+        # diagonal headings sweep the chassis into the pallet.
+        if near_pickup:
+            return True
+        return travelled <= 0.25 and abs(turn) <= 0.05
+    # The controller turns in place at the edge's START, then translates at
+    # the destination heading. Check that exact sequence, not a diagonal
+    # interpolation that might permit a turn beside the pallet at arrival.
+    turns=max(1,int(math.ceil(abs(turn)/.05)))
+    for index in range(turns+1):
+        if not clear_pose((a[0],a[1],a[2]+turn*index/turns),0.):
+            return False
+    steps=max(1,int(math.ceil(length/.02)))
+    for index in range(steps+1):
+        fraction=index/steps
+        pose=(a[0]+(b[0]-a[0])*fraction,a[1]+(b[1]-a[1])*fraction,b[2])
+        if not clear_pose(pose,length*fraction):
             return False
     return True
 
@@ -587,7 +662,7 @@ def route_around(start, goal):
     """
     if _segment_clear(start, goal):
         return [goal]
-    pad = BASE_HALF[0] + BASE_HALF[1] + BASE_MARGIN + 0.08
+    pad = max(BASE_HALF) + BASE_MARGIN + 0.06
     pallet_x, pallet_y, pallet_w, pallet_h = _keep_out_rects()[0]
     stand_x, stand_y, stand_w, stand_h = _keep_out_rects()[1]
     west = pallet_x - pad
@@ -604,7 +679,28 @@ def route_around(start, goal):
         (east, goal[1], goal[2]),
         (west, goal[1], goal[2]),
     )
-    nodes = (start, goal, *gates)
+    # Include close obstacle corners; the previous outer gates forced large
+    # detours even when a shorter path along the stand or pallet was clear.
+    corners = []
+    for x,y,w,h in _keep_out_rects():
+        for cx in (x-pad,x+w+pad):
+            for cy in (y-pad,y+h+pad):
+                for yaw in (start[2],goal[2]):
+                    pose=(cx,cy,yaw)
+                    if base_is_clear(pose):
+                        corners.append(pose)
+    # A side parking pose can translate safely while being too close to
+    # rotate. Offer a short outward escape before asking it to turn.
+    turn_pad = math.hypot(*BASE_HALF)+BASE_MARGIN+.06
+    escapes = []
+    for x,y,w,h in _keep_out_rects():
+        for pose in (start,goal):
+            escapes.extend((cx,pose[1],pose[2]) for cx in (x-turn_pad,x+w+turn_pad))
+            escapes.extend((pose[0],cy,pose[2]) for cy in (y-turn_pad,y+h+turn_pad))
+        corners.extend((cx,cy,yaw) for cx in (x-turn_pad,x+w+turn_pad)
+                       for cy in (y-turn_pad,y+h+turn_pad)
+                       for yaw in (start[2],goal[2]))
+    nodes = tuple(dict.fromkeys((start,goal,*gates,*corners,*escapes)))
     count = len(nodes)
     adjacency = [[] for _ in range(count)]
     for left in range(count):
@@ -632,7 +728,7 @@ def route_around(start, goal):
                 previous[nxt] = current
                 pending.add(nxt)
     if previous[1] < 0 and distance[1] == float("inf"):
-        return [goal]
+        raise NoBasePose(f"底盘无法绕开障碍物：{start} -> {goal}")
     path = []
     cursor = 1
     while cursor > 0:
@@ -673,7 +769,7 @@ def riser_size():
 
 
 def stand_center():
-    return (PICKUP_XY[0], PICKUP_XY[1], STAND_TOP_Z - STAND_SIZE[2] / 2.0)
+    return (STAND_XY[0], STAND_XY[1], STAND_TOP_Z - STAND_SIZE[2] / 2.0)
 
 
 def pickup_center():
